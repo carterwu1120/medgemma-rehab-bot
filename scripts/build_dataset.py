@@ -112,7 +112,7 @@ def filter_and_add(
         )
         count += 1
 
-        if count >= limit:
+        if limit > 0 and count >= limit:
             break
 
     return count
@@ -120,10 +120,10 @@ def filter_and_add(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build rehab-focused training JSONL from HF datasets.")
-    parser.add_argument("--out", type=str, default="/workspace/data/rehab_train.jsonl")
-    parser.add_argument("--medquad-limit", type=int, default=30)
-    parser.add_argument("--chatdoctor-limit", type=int, default=70)
-    parser.add_argument("--genmed-limit", type=int, default=50)
+    parser.add_argument("--out", type=str, default="data/rehab_train.jsonl")
+    parser.add_argument("--medquad-limit", type=int, default=0)
+    parser.add_argument("--chatdoctor-limit", type=int, default=0)
+    parser.add_argument("--genmed-limit", type=int, default=0)
     return parser.parse_args()
 
 
