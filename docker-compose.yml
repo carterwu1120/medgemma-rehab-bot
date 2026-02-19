@@ -1,0 +1,52 @@
+services:
+  preprocess:
+    build:
+      context: .
+      dockerfile: docker/preprocess/Dockerfile
+    env_file:
+      - .env
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN}
+    volumes:
+      - ./data:/workspace/data
+      - ./outputs:/workspace/outputs
+      - ./hf_cache:/root/.cache/huggingface
+    command:
+      - --out
+      - ${OUTPUT_JSONL:-/workspace/data/rehab_train.jsonl}
+      - --medquad-limit
+      - ${MEDQUAD_LIMIT:-30}
+      - --chatdoctor-limit
+      - ${CHATDOCTOR_LIMIT:-70}
+      - --genmed-limit
+      - ${GENMED_LIMIT:-50}
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    env_file:
+      - .env
+    environment:
+      HF_TOKEN: ${HF_TOKEN}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./hf_cache:/root/.cache/huggingface
+    ipc: host
+    gpus: all
+    command:
+      - --model
+      - ${VLLM_MODEL}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --dtype
+      - auto
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-8192}
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
+      - --tensor-parallel-size
+      - ${VLLM_TP_SIZE:-1}

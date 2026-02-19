@@ -1,0 +1,4 @@
+.env
+hf_cache/
+outputs/
+data/*.jsonl
