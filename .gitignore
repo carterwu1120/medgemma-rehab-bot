@@ -2,3 +2,4 @@
 hf_cache/
 outputs/
 data/*.jsonl
+scripts/__pycache__/
