@@ -34,7 +34,6 @@ services:
     volumes:
       - ./hf_cache:/root/.cache/huggingface
     ipc: host
-    gpus: all
     command:
       - --model
       - ${VLLM_MODEL}
