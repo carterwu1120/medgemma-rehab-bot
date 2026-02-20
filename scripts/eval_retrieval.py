@@ -21,8 +21,17 @@ SAFETY_QUERY_PATTERNS = [
         r"\b(stop|urgent|emergency|seek medical care|seek care|see a doctor|go to er|red flag|dizziness|chest pain|numbness|weakness|fever|night pain|should i continue|can i keep training|can i continue)\b",
         re.IGNORECASE,
     ),
-    re.compile(r"(停止|就醫|急診|紅旗|胸痛|暈|麻木|無力|發燒|夜間痛|惡化|繼續練|繼續運動|要不要停|是否停止|可不可以繼續)"),
+    re.compile(r"(停止|就醫|急診|紅旗|胸痛|暈|麻木|無力|發燒|夜間痛|惡化|繼續練|繼續運動|要不要停|是否停止|可不可以繼續|還要繼續嗎|還能繼續嗎|繼續嗎)"),
 ]
+BODY_HINT_PATTERNS = {
+    "body_shoulder": re.compile(r"\b(shoulder|rotator cuff|scapula)\b|肩|肩膀|旋轉肌袖", re.IGNORECASE),
+    "body_neck_trap": re.compile(r"\b(neck|cervical|trapezius)\b|頸|肩頸|斜方肌", re.IGNORECASE),
+    "body_back_spine": re.compile(r"\b(back|lumbar|thoracic|spine|low back)\b|背|腰|脊椎|下背", re.IGNORECASE),
+    "body_knee": re.compile(r"\b(knee|patella|meniscus)\b|膝|膝蓋|半月板", re.IGNORECASE),
+    "body_ankle_foot": re.compile(r"\b(ankle|foot|achilles|plantar)\b|踝|腳踝|足底|跟腱", re.IGNORECASE),
+    "body_hip_glute": re.compile(r"\b(hip|glute|buttock)\b|髖|臀|臀肌", re.IGNORECASE),
+    "body_elbow_wrist_hand": re.compile(r"\b(elbow|wrist|forearm|hand)\b|手肘|手腕|前臂|手", re.IGNORECASE),
+}
 METHOD_ALIASES = {
     "dense": "bge_m3_dense",
     "bge_m3": "bge_m3_dense_sparse",
@@ -147,6 +156,14 @@ def has_safety_intent(query: str) -> bool:
     return any(pattern.search(query) for pattern in SAFETY_QUERY_PATTERNS)
 
 
+def infer_expected_body_tags(query: str) -> set[str]:
+    expected: set[str] = set()
+    for tag, pattern in BODY_HINT_PATTERNS.items():
+        if pattern.search(query):
+            expected.add(tag)
+    return expected
+
+
 def rerank_with_safety_policy(
     hits: List[RetrievedChunk],
     query: str,
@@ -206,7 +223,12 @@ def backfill_safety_chunk(
     if not fallback_safety:
         return current_hits, False
 
-    best = fallback_safety[0]
+    expected_body = infer_expected_body_tags(query)
+    if expected_body:
+        body_aligned = [h for h in fallback_safety if expected_body & set(h.tags)]
+        best = body_aligned[0] if body_aligned else fallback_safety[0]
+    else:
+        best = fallback_safety[0]
     merged: List[RetrievedChunk] = [best]
     merged.extend([h for h in current_hits if h.chunk_id != best.chunk_id])
     return merged[:top_k], True
