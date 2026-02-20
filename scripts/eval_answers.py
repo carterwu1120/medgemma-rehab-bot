@@ -13,20 +13,24 @@ from llm_api import create_vllm_api
 from rag import BM25Retriever, RehabRAG
 
 
-CHUNK_ID_PATTERN = re.compile(r"[A-Za-z0-9_]+_p\d+_c\d+")
+# chunk_id often contains '-' in source-derived prefixes.
+CHUNK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+_p\d+_c\d+")
 STEP_PATTERN = re.compile(r"(^|\n)\s*(\d+[\.\)]|[-*])\s+", re.MULTILINE)
 DOSAGE_PATTERN = re.compile(
     r"\b(\d+\s*(sets?|reps?|times?|minutes?|mins?|sec|seconds?))\b|"
     r"(每\s*(天|週)\s*\d+\s*次)|(每組\s*\d+\s*次)|(分鐘|秒)",
     re.IGNORECASE,
 )
-STOP_PATTERN = re.compile(r"\b(stop|discontinue|pause|worse|worsen)\b|停止|惡化|中止", re.IGNORECASE)
+STOP_PATTERN = re.compile(
+    r"\b(stop|discontinue|pause|worse|worsen|halt|hold)\b|停止|停訓|停练|惡化|恶化|中止",
+    re.IGNORECASE,
+)
 RED_FLAG_PATTERN = re.compile(
-    r"\b(red flag|numbness|weakness|fever|chest pain|dizziness|night pain)\b|紅旗|麻木|無力|發燒|胸痛|暈|夜間痛",
+    r"\b(red flag|numbness|weakness|fever|chest pain|dizziness|night pain)\b|紅旗|麻木|無力|无力|發燒|发烧|胸痛|暈|晕|夜間痛|夜间痛",
     re.IGNORECASE,
 )
 SEEK_CARE_PATTERN = re.compile(
-    r"\b(seek medical care|see a doctor|emergency|go to er)\b|就醫|急診|看醫生",
+    r"\b(seek medical care|see a doctor|emergency|go to er|medical attention)\b|就醫|就医|急診|急诊|看醫生|看医生",
     re.IGNORECASE,
 )
 PROGRESSION_PATTERN = re.compile(r"\b(progress|gradual|increase|phase)\b|漸進|進階|逐步|階段", re.IGNORECASE)

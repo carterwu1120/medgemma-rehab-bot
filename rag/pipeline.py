@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 from llm_api import VLLMApi
 
 from .bm25 import BM25Retriever, RetrievedChunk
+from .query_rewrite import QueryRewriter, QueryVariant, default_query_rewriter
 
 
 SYSTEM_PROMPT = (
@@ -33,6 +34,7 @@ BODY_HINT_PATTERNS: Dict[str, re.Pattern[str]] = {
     "body_hip_glute": re.compile(r"\b(hip|glute|buttock)\b|髖|臀|臀肌", re.IGNORECASE),
     "body_elbow_wrist_hand": re.compile(r"\b(elbow|wrist|forearm|hand)\b|手肘|手腕|前臂|手", re.IGNORECASE),
 }
+CHUNK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+_p\d+_c\d+")
 
 
 @dataclass
@@ -55,6 +57,8 @@ class RehabRAG:
         body_boost: float = 0.35,
         body_mismatch_penalty: float = 0.20,
         body_min_hits: int = 2,
+        query_rewriter: Optional[QueryRewriter] = None,
+        rrf_k: int = 60,
     ) -> None:
         self.retriever = retriever
         self.llm_api = llm_api
@@ -65,6 +69,60 @@ class RehabRAG:
         self.body_boost = max(0.0, body_boost)
         self.body_mismatch_penalty = max(0.0, body_mismatch_penalty)
         self.body_min_hits = max(0, body_min_hits)
+        self.query_rewriter = query_rewriter if query_rewriter is not None else default_query_rewriter()
+        self.rrf_k = max(1, rrf_k)
+
+    def _retrieve_candidates(self, query: str, top_k: int) -> tuple[List[RetrievedChunk], List[str]]:
+        notes: List[str] = []
+        if not self.query_rewriter:
+            return self.retriever.search(query=query, top_k=top_k), notes
+
+        variants = self.query_rewriter.rewrite(query)
+        if not variants:
+            variants = [QueryVariant(text=query, source="original", weight=1.0)]
+
+        if len(variants) > 1:
+            notes.append(f"query_rewrite_variants={len(variants)}")
+            notes.append("query_rewrite_sources=" + ",".join(sorted({v.source for v in variants if v.source != "original"})))
+
+        variant_hits: List[tuple[QueryVariant, List[RetrievedChunk]]] = []
+        for variant in variants:
+            hits = self.retriever.search(query=variant.text, top_k=top_k)
+            if hits:
+                variant_hits.append((variant, hits))
+
+        if not variant_hits:
+            return [], notes
+
+        # Reciprocal-rank fusion keeps this extensible across heterogeneous retrievers.
+        fused_scores: Dict[str, float] = {}
+        chunk_by_id: Dict[str, RetrievedChunk] = {}
+        for variant, hits in variant_hits:
+            for rank, chunk in enumerate(hits, start=1):
+                fused_scores[chunk.chunk_id] = fused_scores.get(chunk.chunk_id, 0.0) + (
+                    float(variant.weight) / float(self.rrf_k + rank)
+                )
+                prev = chunk_by_id.get(chunk.chunk_id)
+                if prev is None or chunk.score > prev.score:
+                    chunk_by_id[chunk.chunk_id] = chunk
+
+        ordered = sorted(fused_scores.items(), key=lambda kv: kv[1], reverse=True)
+        fused: List[RetrievedChunk] = []
+        for chunk_id, score in ordered[:top_k]:
+            base = chunk_by_id[chunk_id]
+            fused.append(
+                RetrievedChunk(
+                    score=score,
+                    chunk_id=base.chunk_id,
+                    text=base.text,
+                    source_name=base.source_name,
+                    page=base.page,
+                    title=base.title,
+                    tags=base.tags,
+                )
+            )
+
+        return fused, notes
 
     @staticmethod
     def _has_safety_intent(query: str) -> bool:
@@ -188,7 +246,7 @@ class RehabRAG:
 
     def retrieve(self, query: str, top_k: int = 5) -> List[RetrievedChunk]:
         retrieval_k = max(top_k, self.candidate_pool)
-        base_hits = self.retriever.search(query=query, top_k=retrieval_k)
+        base_hits, _ = self._retrieve_candidates(query=query, top_k=retrieval_k)
         body_hits, _ = self._apply_body_policy(query=query, hits=base_hits, top_k=top_k)
         hits, _ = self._apply_safety_policy(query=query, hits=body_hits, top_k=top_k)
         return hits
@@ -203,12 +261,32 @@ class RehabRAG:
             )
         return "\n\n".join(lines)
 
+    @staticmethod
+    def _extract_chunk_refs(text: str) -> List[str]:
+        return sorted(set(CHUNK_ID_PATTERN.findall(text)))
+
+    @staticmethod
+    def _ensure_reference_block(answer: str, chunks: List[RetrievedChunk], max_refs: int = 3) -> str:
+        if not chunks:
+            return answer
+
+        refs_in_answer = set(RehabRAG._extract_chunk_refs(answer))
+        retrieved_ids = [chunk.chunk_id for chunk in chunks]
+        valid_refs = [chunk_id for chunk_id in retrieved_ids if chunk_id in refs_in_answer]
+        if valid_refs:
+            return answer
+
+        appended = "\n\nReferences:\n"
+        for chunk_id in retrieved_ids[: max(1, max_refs)]:
+            appended += f"- {chunk_id}\n"
+        return answer.rstrip() + appended
+
     def answer(self, query: str, top_k: int = 5, temperature: float = 0.2, max_tokens: int = 512) -> RAGResult:
         retrieval_k = max(top_k, self.candidate_pool)
-        base_hits = self.retriever.search(query=query, top_k=retrieval_k)
+        base_hits, rewrite_notes = self._retrieve_candidates(query=query, top_k=retrieval_k)
         body_hits, body_notes = self._apply_body_policy(query=query, hits=base_hits, top_k=top_k)
         chunks, safety_notes = self._apply_safety_policy(query=query, hits=body_hits, top_k=top_k)
-        policy_notes = body_notes + safety_notes
+        policy_notes = rewrite_notes + body_notes + safety_notes
         context_text = self._format_context(chunks)
         safety_intent = self._has_safety_intent(query)
         tags_all = {tag for chunk in chunks for tag in chunk.tags}
@@ -253,9 +331,10 @@ class RehabRAG:
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        final_answer = self._ensure_reference_block(response.text, chunks)
 
         return RAGResult(
-            answer=response.text,
+            answer=final_answer,
             retrieved=chunks,
             context_text=context_text,
             policy_notes=policy_notes,
