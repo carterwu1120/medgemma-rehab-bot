@@ -69,3 +69,35 @@ curl http://localhost:8000/v1/chat/completions \
 
 - Use this stack first for RAG baseline and reproducible demo.
 - If you later fine-tune with LoRA, keep vLLM as the deployment layer.
+
+## 6) Local Backend API (for Next.js frontend)
+
+Install backend deps once:
+
+```bash
+uv pip install -r requirements-api.txt
+```
+
+Run backend:
+
+```bash
+./bin/run_backend_api.sh
+```
+
+Health check:
+
+```bash
+curl http://localhost:9000/health
+```
+
+Chat + video recommendation endpoint:
+
+```bash
+curl -X POST http://localhost:9000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query":"我背部有點痠痛，請給我建議並推薦影片",
+    "top_k":8,
+    "video_limit":3
+  }'
+```
