@@ -83,6 +83,18 @@ DOSAGE_REGEXES = [
     re.compile(r"維持\s*\d+\s*(秒|分鐘)", re.IGNORECASE),
 ]
 
+SAFETY_STOP_REGEXES = [
+    re.compile(
+        r"(pain|soreness|symptoms?).{0,24}(persist|lasting|lasts|more than|over).{0,12}(48|72)\s*(hours?|hrs?)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(疼痛|痠痛|症狀).{0,24}(持續|超過|超出).{0,8}(48|72)\s*(小時|hr|hrs|hours)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(疼痛|痠痛).{0,18}(超過|大於|達到).{0,6}(3|三)\s*(天)", re.IGNORECASE),
+]
+
 TAG_RULES = {
     "body_neck_trap": [
         "neck",
@@ -187,6 +199,13 @@ TAG_RULES = {
         "就醫",
         "胸痛",
         "暈眩",
+        "pain persists more than 72 hours",
+        "pain lasts more than 48 hours",
+        "persistent pain after exercise",
+        "超過72小時疼痛",
+        "超過48小時疼痛",
+        "疼痛超過三天",
+        "症狀超過三天未改善",
     ],
     "prescription_dosage": [
         "set",
@@ -351,6 +370,8 @@ def infer_tags(text: str) -> list[str]:
 
     if any(regex.search(text) for regex in DOSAGE_REGEXES):
         tags.append("prescription_dosage")
+    if any(regex.search(text) for regex in SAFETY_STOP_REGEXES):
+        tags.append("safety_stop_rules")
 
     return sorted(set(tags))
 

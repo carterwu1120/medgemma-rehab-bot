@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -14,6 +15,14 @@ from rag import BM25Retriever, BGEM3DenseRetriever, BGEM3DenseSparseRetriever, R
 
 
 SAFETY_TAGS = {"safety_red_flags", "safety_stop_rules"}
+SAFETY_ROUTE_SUFFIX = " stop exercise seek medical care red flag 停止運動 就醫 紅旗 立即停止"
+SAFETY_QUERY_PATTERNS = [
+    re.compile(
+        r"\b(stop|urgent|emergency|seek medical care|seek care|see a doctor|go to er|red flag|dizziness|chest pain|numbness|weakness|fever|night pain|should i continue|can i keep training|can i continue)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(停止|就醫|急診|紅旗|胸痛|暈|麻木|無力|發燒|夜間痛|惡化|繼續練|繼續運動|要不要停|是否停止|可不可以繼續)"),
+]
 METHOD_ALIASES = {
     "dense": "bge_m3_dense",
     "bge_m3": "bge_m3_dense_sparse",
@@ -52,6 +61,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--candidate-pool", type=int, default=30, help="Candidate size for hybrid merge.")
     parser.add_argument("--hybrid-alpha", type=float, default=0.5, help="BM25 weight in hybrid score.")
+    parser.add_argument(
+        "--safety-boost",
+        type=float,
+        default=0.0,
+        help="Add score bonus to chunks tagged with safety_* when query has safety intent.",
+    )
+    parser.add_argument(
+        "--safety-route",
+        action="store_true",
+        help="If safety-intent query has no safety_* chunk in top-k, force-inject best safety chunk from candidates.",
+    )
 
     parser.add_argument("--bge-dense-model", default="BAAI/bge-m3")
     parser.add_argument("--bge-dense-embeddings", default="artifacts/rag/bge_m3_dense_only.npy")
@@ -123,6 +143,75 @@ def safety_hit(hits: List[RetrievedChunk]) -> bool:
     return any(bool(SAFETY_TAGS & set(h.tags)) for h in hits)
 
 
+def has_safety_intent(query: str) -> bool:
+    return any(pattern.search(query) for pattern in SAFETY_QUERY_PATTERNS)
+
+
+def rerank_with_safety_policy(
+    hits: List[RetrievedChunk],
+    query: str,
+    top_k: int,
+    safety_boost: float,
+    safety_route: bool,
+) -> List[RetrievedChunk]:
+    if not hits:
+        return []
+
+    safety_intent = has_safety_intent(query)
+    if not safety_intent:
+        return hits[:top_k]
+
+    scored: List[tuple[float, RetrievedChunk]] = []
+    for hit in hits:
+        boost = safety_boost if (SAFETY_TAGS & set(hit.tags)) else 0.0
+        scored.append((float(hit.score) + boost, hit))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    reranked: List[RetrievedChunk] = [
+        RetrievedChunk(
+            score=score,
+            chunk_id=hit.chunk_id,
+            text=hit.text,
+            source_name=hit.source_name,
+            page=hit.page,
+            title=hit.title,
+            tags=hit.tags,
+        )
+        for score, hit in scored
+    ]
+    top = reranked[:top_k]
+
+    if safety_route and not safety_hit(top):
+        safety_candidates = [h for h in reranked if SAFETY_TAGS & set(h.tags)]
+        if safety_candidates:
+            routed = [safety_candidates[0]]
+            routed.extend([h for h in top if h.chunk_id != safety_candidates[0].chunk_id])
+            return routed[:top_k]
+    return top
+
+
+def backfill_safety_chunk(
+    query: str,
+    current_hits: List[RetrievedChunk],
+    retriever_bm25: BM25Retriever,
+    top_k: int,
+    candidate_pool: int,
+) -> tuple[List[RetrievedChunk], bool]:
+    if safety_hit(current_hits):
+        return current_hits, False
+
+    expanded_query = f"{query}{SAFETY_ROUTE_SUFFIX}"
+    fallback_hits = retriever_bm25.search(expanded_query, top_k=max(top_k, candidate_pool, 20))
+    fallback_safety = [h for h in fallback_hits if SAFETY_TAGS & set(h.tags)]
+    if not fallback_safety:
+        return current_hits, False
+
+    best = fallback_safety[0]
+    merged: List[RetrievedChunk] = [best]
+    merged.extend([h for h in current_hits if h.chunk_id != best.chunk_id])
+    return merged[:top_k], True
+
+
 def normalize_scores(hits: List[RetrievedChunk]) -> Dict[str, float]:
     if not hits:
         return {}
@@ -174,6 +263,8 @@ def evaluate_method(
     retriever_bge_mixed: Optional[BGEM3DenseSparseRetriever],
     candidate_pool: int,
     hybrid_alpha: float,
+    safety_boost: float,
+    safety_route: bool,
     docs_by_chunk: Dict[str, Dict[str, Any]],
     detailed_rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -185,19 +276,21 @@ def evaluate_method(
 
     for q in queries:
         t0 = time.time()
+        safety_routed = False
+        retrieval_k = max(top_k, candidate_pool) if (safety_boost > 0 or safety_route) else top_k
 
         if method == "bm25":
-            hits = retriever_bm25.search(q.query, top_k=top_k)
+            hits = retriever_bm25.search(q.query, top_k=retrieval_k)
 
         elif method == "bge_m3_dense":
             if retriever_bge_dense is None:
                 raise RuntimeError("bge-m3 dense retriever is not initialized.")
-            hits = retriever_bge_dense.search(q.query, top_k=top_k)
+            hits = retriever_bge_dense.search(q.query, top_k=retrieval_k)
 
         elif method == "bge_m3_dense_sparse":
             if retriever_bge_mixed is None:
                 raise RuntimeError("bge-m3 dense+sparse retriever is not initialized.")
-            hits = retriever_bge_mixed.search(q.query, top_k=top_k)
+            hits = retriever_bge_mixed.search(q.query, top_k=retrieval_k)
 
         elif method == "hybrid_bge_m3_dense":
             if retriever_bge_dense is None:
@@ -209,7 +302,7 @@ def evaluate_method(
                 second_hits=dense_hits,
                 docs_by_chunk=docs_by_chunk,
                 alpha=hybrid_alpha,
-                top_k=top_k,
+                top_k=max(top_k, candidate_pool),
             )
 
         elif method == "hybrid_bge_m3_dense_sparse":
@@ -224,11 +317,27 @@ def evaluate_method(
                 second_hits=mixed_hits,
                 docs_by_chunk=docs_by_chunk,
                 alpha=hybrid_alpha,
-                top_k=top_k,
+                top_k=max(top_k, candidate_pool),
             )
 
         else:
             raise ValueError(f"Unknown method: {method}")
+
+        hits = rerank_with_safety_policy(
+            hits=hits,
+            query=q.query,
+            top_k=top_k,
+            safety_boost=safety_boost,
+            safety_route=safety_route,
+        )
+        if safety_route and has_safety_intent(q.query):
+            hits, safety_routed = backfill_safety_chunk(
+                query=q.query,
+                current_hits=hits,
+                retriever_bm25=retriever_bm25,
+                top_k=top_k,
+                candidate_pool=candidate_pool,
+            )
 
         latencies.append((time.time() - t0) * 1000.0)
 
@@ -254,6 +363,7 @@ def evaluate_method(
                 "mrr": rr,
                 "is_safety_query": q.is_safety_query,
                 "safety_hit": safety_hit(hits) if q.is_safety_query else None,
+                "safety_routed": safety_routed,
                 "top_chunks": [
                     {
                         "rank": i,
@@ -344,6 +454,8 @@ def main() -> None:
             retriever_bge_mixed=bge_mixed,
             candidate_pool=args.candidate_pool,
             hybrid_alpha=args.hybrid_alpha,
+            safety_boost=args.safety_boost,
+            safety_route=args.safety_route,
             docs_by_chunk=docs_by_chunk,
             detailed_rows=detailed_rows,
         )
