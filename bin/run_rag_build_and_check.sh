@@ -19,6 +19,7 @@ BUILD_ARGS=(
   --chunk-size "${PDF_CHUNK_SIZE:-1200}"
   --overlap "${PDF_CHUNK_OVERLAP:-150}"
   --min-chars "${PDF_MIN_CHARS:-80}"
+  --chunk-strategy "${PDF_CHUNK_STRATEGY:-fixed}"
   --min-tag-count "${PDF_MIN_TAG_COUNT:-1}"
   --reject-output "${PDF_REJECT_OUTPUT:-outputs/canonical_rejects.jsonl}"
   --include-files "${PDF_INCLUDE_FILES:-}"

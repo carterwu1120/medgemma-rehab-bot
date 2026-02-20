@@ -72,6 +72,7 @@ NOISE_CHUNK_PATTERNS = [
 SECTION_STOP_PATTERN = re.compile(r"^(references|bibliography|acknowledg(e)?ments?)\b", re.IGNORECASE)
 NOISE_LINE_REGEXES = [re.compile(p, re.IGNORECASE) for p in NOISE_LINE_PATTERNS]
 NOISE_CHUNK_REGEXES = [re.compile(p, re.IGNORECASE) for p in NOISE_CHUNK_PATTERNS]
+SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<=[。！？!?;；\.])\s+")
 
 DOSAGE_REGEXES = [
     re.compile(r"\b\d+\s*(sets?|reps?|repetitions?)\b", re.IGNORECASE),
@@ -262,7 +263,14 @@ def is_noise_line(line: str) -> bool:
     return False
 
 
-def chunk_text(text: str, chunk_size: int, overlap: int, min_chars: int) -> list[str]:
+def split_sentences(text: str) -> list[str]:
+    if not text:
+        return []
+    parts = SENTENCE_BOUNDARY_PATTERN.split(text)
+    return [part.strip() for part in parts if part and part.strip()]
+
+
+def chunk_text_fixed(text: str, chunk_size: int, overlap: int, min_chars: int) -> list[str]:
     if not text:
         return []
     step = max(1, chunk_size - overlap)
@@ -272,6 +280,66 @@ def chunk_text(text: str, chunk_size: int, overlap: int, min_chars: int) -> list
         if len(chunk) >= min_chars:
             chunks.append(chunk)
     return chunks
+
+
+def chunk_text_sentence(text: str, chunk_size: int, overlap: int, min_chars: int) -> list[str]:
+    if not text:
+        return []
+
+    sentences = split_sentences(text)
+    if not sentences:
+        return chunk_text_fixed(text, chunk_size=chunk_size, overlap=overlap, min_chars=min_chars)
+
+    chunks: list[str] = []
+    current_sentences: list[str] = []
+    current_len = 0
+
+    def flush_current() -> None:
+        if not current_sentences:
+            return
+        chunk = " ".join(current_sentences).strip()
+        if len(chunk) >= min_chars:
+            chunks.append(chunk)
+
+    for sentence in sentences:
+        sentence_len = len(sentence) + 1
+        if current_sentences and current_len + sentence_len > chunk_size:
+            flush_current()
+
+            if overlap > 0:
+                overlap_buffer: list[str] = []
+                overlap_len = 0
+                for prev_sentence in reversed(current_sentences):
+                    overlap_buffer.append(prev_sentence)
+                    overlap_len += len(prev_sentence) + 1
+                    if overlap_len >= overlap:
+                        break
+                current_sentences = list(reversed(overlap_buffer))
+                current_len = sum(len(s) + 1 for s in current_sentences)
+            else:
+                current_sentences = []
+                current_len = 0
+
+        current_sentences.append(sentence)
+        current_len += sentence_len
+
+    flush_current()
+
+    if not chunks and len(text) >= min_chars:
+        return [text.strip()]
+    return chunks
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int,
+    overlap: int,
+    min_chars: int,
+    strategy: str = "fixed",
+) -> list[str]:
+    if strategy == "sentence":
+        return chunk_text_sentence(text=text, chunk_size=chunk_size, overlap=overlap, min_chars=min_chars)
+    return chunk_text_fixed(text=text, chunk_size=chunk_size, overlap=overlap, min_chars=min_chars)
 
 
 def infer_tags(text: str) -> list[str]:
@@ -335,6 +403,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=1200, help="Chunk size in characters")
     parser.add_argument("--overlap", type=int, default=150, help="Overlap size in characters")
     parser.add_argument("--min-chars", type=int, default=80, help="Minimum chunk length")
+    parser.add_argument(
+        "--chunk-strategy",
+        choices=["fixed", "sentence"],
+        default="fixed",
+        help="Chunking strategy: fixed-width chars or sentence-aware packing.",
+    )
     parser.add_argument(
         "--allow-general",
         action="store_true",
@@ -412,6 +486,7 @@ def main() -> None:
                         chunk_size=args.chunk_size,
                         overlap=args.overlap,
                         min_chars=args.min_chars,
+                        strategy=args.chunk_strategy,
                     )
 
                     kept_idx = 0
@@ -464,7 +539,8 @@ def main() -> None:
     reason_str = ", ".join(f"{k}:{v}" for k, v in reject_reasons.most_common()) or "none"
     print(
         f"Done. docs={total_docs}, chunks={total_chunks}, skipped_chunks={skipped_chunks}, "
-        f"reject_reasons={reason_str}, skipped_files={skipped_files}, output={output_path}"
+        f"reject_reasons={reason_str}, skipped_files={skipped_files}, "
+        f"chunk_strategy={args.chunk_strategy}, output={output_path}"
     )
     if reject_path:
         print(f"Reject log: {reject_path}")
