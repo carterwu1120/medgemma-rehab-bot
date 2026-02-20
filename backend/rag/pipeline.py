@@ -2,7 +2,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from llm_api import VLLMApi
+from backend.llm_api import VLLMApi
 
 from .bm25 import BM25Retriever, RetrievedChunk
 from .query_rewrite import QueryRewriter, QueryVariant, default_query_rewriter

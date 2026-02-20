@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Optional, Protocol, Set
 from urllib import error, request
 from urllib.parse import quote_plus, urlencode
 
-from rag.pipeline import BODY_HINT_PATTERNS, SAFETY_QUERY_PATTERNS
+from backend.rag.pipeline import BODY_HINT_PATTERNS, SAFETY_QUERY_PATTERNS
 
 
 CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")

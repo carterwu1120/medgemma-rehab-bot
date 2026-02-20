@@ -4,6 +4,7 @@ outputs/
 data/*.jsonl
 scripts/__pycache__/
 */__pycache__/
+__pycache__/
 raw_data/pdfs/*.pdf
 data/canonical_docs.jsonl
 artifacts/

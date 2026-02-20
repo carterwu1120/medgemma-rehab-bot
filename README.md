@@ -4,6 +4,17 @@ This folder gives you a minimal local stack for:
 - dataset preprocessing from Hugging Face
 - MedGemma inference service with vLLM in Docker
 
+## Project Layout
+
+- `backend/`: backend application code
+  - `backend/api/`: FastAPI service
+  - `backend/llm_api/`: vLLM client wrapper
+  - `backend/rag/`: retrieval/ranking pipeline
+  - `backend/recommendation/`: video recommendation providers
+- `scripts/`: CLI utilities for data build / eval / local tests
+- `bin/`: runnable shell entrypoints
+- `data/`, `raw_data/`, `artifacts/`, `outputs/`: datasets, indexes, and reports
+
 ## 1) Prerequisites
 
 - Docker Engine + Docker Compose v2

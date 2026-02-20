@@ -14,8 +14,7 @@ HOST="${BACKEND_HOST:-0.0.0.0}"
 PORT="${BACKEND_PORT:-9000}"
 
 if [[ "${BACKEND_RELOAD:-0}" == "1" ]]; then
-  exec uvicorn api.server:app --host "$HOST" --port "$PORT" --reload
+  exec uvicorn backend.api.server:app --host "$HOST" --port "$PORT" --reload
 fi
 
-exec uvicorn api.server:app --host "$HOST" --port "$PORT"
-
+exec uvicorn backend.api.server:app --host "$HOST" --port "$PORT"

@@ -7,9 +7,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from llm_api import create_vllm_api
-from rag import BM25Retriever, RehabRAG, RetrievedChunk
-from recommendation import (
+from backend.llm_api import create_vllm_api
+from backend.rag import BM25Retriever, RehabRAG, RetrievedChunk
+from backend.recommendation import (
     CatalogVideoProvider,
     VideoCandidate,
     VideoRecommender,
@@ -210,4 +210,3 @@ def chat(req: ChatRequest) -> ChatResponse:
         retrieved_chunks=[_chunk_to_out(c) for c in result.retrieved],
         videos=[_video_to_out(v, language=language) for v in videos],
     )
-
