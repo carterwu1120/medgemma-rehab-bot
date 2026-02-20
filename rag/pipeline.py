@@ -12,8 +12,9 @@ SYSTEM_PROMPT = (
     "You are a cautious home rehabilitation assistant. "
     "Always prioritize safety. Do not diagnose. "
     "If red-flag symptoms appear, advise urgent medical care. "
-    "Answer in Traditional Chinese unless user asks otherwise. "
-    "Only use retrieved evidence; do not invent treatment details."
+    "Always answer in the same language as the user's query. "
+    "Only use retrieved evidence; do not invent treatment details. "
+    "When the query is vague, ask targeted clarification questions first."
 )
 
 SAFETY_TAGS = {"safety_red_flags", "safety_stop_rules"}
@@ -35,6 +36,23 @@ BODY_HINT_PATTERNS: Dict[str, re.Pattern[str]] = {
     "body_elbow_wrist_hand": re.compile(r"\b(elbow|wrist|forearm|hand)\b|手肘|手腕|前臂|手", re.IGNORECASE),
 }
 CHUNK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+_p\d+_c\d+")
+CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
+DURATION_PATTERN = re.compile(
+    r"\b\d+\s*(h|hr|hrs|hour|hours|day|days|week|weeks|month|months)\b|"
+    r"\d+\s*(小時|天|週|周|月)",
+    re.IGNORECASE,
+)
+SEVERITY_PATTERN = re.compile(
+    r"\b([0-9]|10)\s*/\s*10\b|"
+    r"\b(pain|sore|stiff|numb|tingling|weakness)\b|"
+    r"(痛|痠|酸|僵硬|緊|麻|刺痛|無力)",
+    re.IGNORECASE,
+)
+TRIGGER_PATTERN = re.compile(
+    r"\b(after|during|when|post|training|lifting|running|sitting|sleep|desk)\b|"
+    r"(運動後|訓練後|久坐|久站|睡前|起床|工作後|抬手|彎腰|跑步後)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -139,6 +157,23 @@ class RehabRAG:
             if pattern.search(query):
                 expected.add(tag)
         return expected
+
+    @staticmethod
+    def _detect_query_language(query: str) -> str:
+        # Minimal language routing for current corpus/use-cases.
+        return "zh" if CJK_PATTERN.search(query) else "en"
+
+    @staticmethod
+    def _is_query_vague(query: str) -> bool:
+        normalized = " ".join(query.strip().split())
+        if len(normalized) <= 10:
+            return True
+        has_body = bool(RehabRAG._infer_expected_body_tags(query))
+        has_duration = bool(DURATION_PATTERN.search(query))
+        has_severity = bool(SEVERITY_PATTERN.search(query))
+        has_trigger = bool(TRIGGER_PATTERN.search(query))
+        detail_score = sum([has_body, has_duration, has_severity, has_trigger])
+        return detail_score <= 1
 
     def _apply_body_policy(
         self,
@@ -281,6 +316,155 @@ class RehabRAG:
             appended += f"- {chunk_id}\n"
         return answer.rstrip() + appended
 
+    def _build_clarification_block(self, query: str, language: str) -> str:
+        expected = self._infer_expected_body_tags(query)
+        if language == "zh":
+            body_hint = "肩頸/下背/手腕/膝踝"
+        else:
+            body_hint = "neck-shoulder/lower back/wrist-knee-ankle"
+        if expected:
+            mapped: List[str] = []
+            if language == "zh":
+                if "body_neck_trap" in expected:
+                    mapped.append("肩頸")
+                if "body_back_spine" in expected:
+                    mapped.append("下背")
+                if "body_elbow_wrist_hand" in expected:
+                    mapped.append("手腕前臂")
+                if "body_shoulder" in expected:
+                    mapped.append("肩關節")
+                if "body_knee" in expected:
+                    mapped.append("膝")
+                if "body_ankle_foot" in expected:
+                    mapped.append("踝足")
+            else:
+                if "body_neck_trap" in expected:
+                    mapped.append("neck/trapezius")
+                if "body_back_spine" in expected:
+                    mapped.append("lower back/spine")
+                if "body_elbow_wrist_hand" in expected:
+                    mapped.append("wrist/forearm/hand")
+                if "body_shoulder" in expected:
+                    mapped.append("shoulder")
+                if "body_knee" in expected:
+                    mapped.append("knee")
+                if "body_ankle_foot" in expected:
+                    mapped.append("ankle/foot")
+            if mapped:
+                body_hint = "/".join(mapped)
+
+        if language == "zh":
+            return (
+                "先確認（為了給你更精準的動作處方，請回覆最接近選項）：\n"
+                f"1) 你是不是主要在「{body_hint}」不舒服？（A是 B不是，請補充部位）\n"
+                "2) 你是不是在特定動作才會痛？（A抬手/轉頭 B彎腰/久坐後 C走路/訓練後 D都會）\n"
+                "3) 你是不是有以下任一狀況？（A麻木無力 B夜間痛醒 C發燒/胸痛/暈眩 D以上皆無）\n"
+            )
+
+        return (
+            "Please confirm first (to provide a precise plan, choose the closest option):\n"
+            f"1) Is the main discomfort in \"{body_hint}\"? (A yes B no, specify location)\n"
+            "2) Is pain triggered by specific movements? (A lifting/turning head B bending/long sitting C walking/training D all)\n"
+            "3) Any of these signs? (A numbness/weakness B night pain waking you up C fever/chest pain/dizziness D none)\n"
+        )
+
+    def _ensure_clarification_block(self, answer: str, query: str, language: str) -> str:
+        lowered = answer.lower()
+        has_block = (
+            "先確認" in answer
+            or "你是不是" in answer
+            or "please confirm" in lowered
+            or "is the main discomfort" in lowered
+        )
+        if has_block:
+            return answer
+        block = self._build_clarification_block(query, language=language)
+        return f"{block}\n{answer}".strip()
+
+    def _build_safety_fallback(self, language: str) -> str:
+        if language == "zh":
+            return (
+                "我目前檢索到的資料不足以直接給出精準建議。\n"
+                "先給你安全原則：若疼痛持續惡化、出現麻木無力、胸痛或暈眩，請立即停止訓練並就醫。\n"
+                "先確認（請回覆最接近的選項）：\n"
+                "1) 你是不是在特定動作才會痛？（A推舉/抬手 B轉頭 C彎腰 D走路/跑步）\n"
+                "2) 你是不是有神經症狀？（A沒有 B偶爾麻 C持續麻或無力）\n"
+                "3) 你是不是已經持續超過72小時或反覆超過2週？（A否 B是）\n"
+                "我再根據資訊提供更精準的居家復健流程。"
+            )
+        return (
+            "I don't have enough retrieved evidence to provide a precise plan yet.\n"
+            "Safety first: if pain is worsening, or you have numbness/weakness, chest pain, or dizziness, stop training and seek medical care now.\n"
+            "Please confirm (choose the closest option):\n"
+            "1) Is pain triggered by a specific movement? (A press/lift B turn head C bend D walk/run)\n"
+            "2) Any neuro symptoms? (A none B occasional numbness C persistent numbness/weakness)\n"
+            "3) Has it lasted >72 hours or recurred for >2 weeks? (A no B yes)\n"
+            "Then I will provide a more precise home-rehab flow."
+        )
+
+    def _build_user_prompt(self, query: str, context_text: str, is_vague_query: bool, language: str) -> str:
+        if language == "zh":
+            clarification_rules = (
+                "釐清規則：\n"
+                "A) 若問題描述模糊，先輸出 `先確認` 區塊，提出 2-3 個「你是不是...」封閉式問題（A/B/C）。\n"
+                "B) 即使先確認，也要給低風險暫行方案（2-3步），直到使用者補充資訊。\n"
+                "C) 若資訊足夠，直接給完整計畫，不要再追問。\n"
+            )
+            response_template = (
+                "回覆格式（依序）：\n"
+                "1) 問題判讀（1-2句）\n"
+                "2) 安全提醒（紅旗、何時停止、何時就醫）\n"
+                "3) 居家計畫（步驟1/2/3...，每步含次數/頻率/停止條件）\n"
+                "4) 進階與回退條件（什麼時候可加量、何時降強度）\n"
+                "5) References（列出 chunk_id）\n"
+            )
+            return (
+                "請根據以下檢索到的資料回答使用者問題。\n"
+                "規則：\n"
+                "1) 先給安全提醒（若有紅旗症狀要立即就醫）。\n"
+                "2) 給可執行、具體、可追蹤的居家復健步驟。\n"
+                "3) 每一步都要提供頻率/次數/停止條件。\n"
+                "4) 每一段建議都必須附上 chunk_id 引用（格式：`[chunk_id]`）。\n"
+                "5) 若證據不足，請明確寫「證據不足，需補充資訊」，不要自行補醫療細節。\n"
+                "6) 最後用 `References` 列出你實際引用的 chunk_id 清單。\n\n"
+                f"{clarification_rules}\n"
+                f"{response_template}\n"
+                f"此次查詢狀態：vague_query={'yes' if is_vague_query else 'no'}。\n"
+                f"使用者問題：\n{query}\n\n"
+                f"檢索內容：\n{context_text if context_text else '（無檢索結果）'}"
+            )
+
+        clarification_rules = (
+            "Clarification rules:\n"
+            "A) If the query is vague, output a `Please confirm` block with 2-3 targeted closed questions (A/B/C).\n"
+            "B) Even when asking clarification, provide a low-risk temporary 2-3 step plan.\n"
+            "C) If information is sufficient, provide a full plan directly.\n"
+        )
+        response_template = (
+            "Response structure (in order):\n"
+            "1) Problem interpretation (1-2 lines)\n"
+            "2) Safety reminders (red flags, stop conditions, when to seek care)\n"
+            "3) Home plan (Step 1/2/3..., each with frequency/reps/stop condition)\n"
+            "4) Progression and deload criteria\n"
+            "5) References (chunk_id list)\n"
+        )
+        return (
+            "Answer the user's question using only the retrieved evidence below.\n"
+            "Rules:\n"
+            "1) Start with safety reminders (urgent care for red-flag symptoms).\n"
+            "2) Provide concrete, actionable, trackable home-rehab steps.\n"
+            "3) Every step must include dosage/frequency and stop conditions.\n"
+            "4) Every recommendation paragraph must cite chunk_id (`[chunk_id]`).\n"
+            "5) If evidence is insufficient, explicitly say so; do not invent medical details.\n"
+            "6) End with a `References` section listing used chunk_id values.\n"
+            "7) Reply in the same language as the user's query.\n\n"
+            f"{clarification_rules}\n"
+            f"{response_template}\n"
+            f"Query state: vague_query={'yes' if is_vague_query else 'no'}.\n"
+            f"User query:\n{query}\n\n"
+            f"Retrieved evidence:\n{context_text if context_text else '(no retrieval results)'}"
+        )
+
     def answer(self, query: str, top_k: int = 5, temperature: float = 0.2, max_tokens: int = 512) -> RAGResult:
         retrieval_k = max(top_k, self.candidate_pool)
         base_hits, rewrite_notes = self._retrieve_candidates(query=query, top_k=retrieval_k)
@@ -295,34 +479,23 @@ class RehabRAG:
             tag.startswith("body_") for tag in tags_all
         )
         has_safety = bool(tags_all & SAFETY_TAGS)
+        is_vague_query = self._is_query_vague(query)
+        query_language = self._detect_query_language(query)
+        if is_vague_query:
+            policy_notes.append("clarification_mode")
 
         if not self.llm_api:
             raise RuntimeError("llm_api is not configured for generation.")
 
         if safety_intent and (not has_expected_body or not has_safety):
             policy_notes.append("insufficient_evidence_gate")
-            fallback_answer = (
-                "我目前檢索到的資料不足以直接給出精準建議。\n"
-                "先給你安全原則：若疼痛持續惡化、出現麻木無力、胸痛或暈眩，請立即停止訓練並就醫。\n"
-                "請補充：\n"
-                "1) 疼痛位置與動作（例如推舉/外展）\n"
-                "2) 疼痛程度(0-10)與持續時間\n"
-                "3) 是否有紅旗症狀（麻、無力、夜間痛、發燒）\n"
-                "我再根據資訊提供更精準的居家復健流程。"
-            )
+            fallback_answer = self._build_safety_fallback(query_language)
             return RAGResult(answer=fallback_answer, retrieved=chunks, context_text=context_text, policy_notes=policy_notes)
-
-        user_prompt = (
-            "請根據以下檢索到的資料回答使用者問題。\n"
-            "規則：\n"
-            "1) 先給安全提醒（若有紅旗症狀要立即就醫）。\n"
-            "2) 給可執行的居家復健步驟。\n"
-            "3) 盡量提供頻率/次數/停止條件。\n"
-            "4) 每一段建議都必須附上 chunk_id 引用（格式：`[chunk_id]`）。\n"
-            "5) 若證據不足，請明確寫「證據不足，需補充資訊」，不要自行補醫療細節。\n"
-            "6) 最後用 `References` 列出你實際引用的 chunk_id 清單。\n\n"
-            f"使用者問題：\n{query}\n\n"
-            f"檢索內容：\n{context_text if context_text else '（無檢索結果）'}"
+        user_prompt = self._build_user_prompt(
+            query=query,
+            context_text=context_text,
+            is_vague_query=is_vague_query,
+            language=query_language,
         )
 
         response = self.llm_api.generate(
@@ -331,7 +504,10 @@ class RehabRAG:
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        final_answer = self._ensure_reference_block(response.text, chunks)
+        final_answer = response.text
+        if is_vague_query:
+            final_answer = self._ensure_clarification_block(final_answer, query, language=query_language)
+        final_answer = self._ensure_reference_block(final_answer, chunks)
 
         return RAGResult(
             answer=final_answer,
