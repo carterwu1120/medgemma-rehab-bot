@@ -31,6 +31,10 @@ from backend.recommendation import (
 
 
 CHUNK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+_p\d+_c\d+")
+REQUEST_LIKE_PATTERN = re.compile(
+    r"(請|可以|怎麼|如何|給我|建議|計畫|方案|should|what|how|can you|advice|plan|\?)",
+    re.IGNORECASE,
+)
 
 
 class ChatRequest(BaseModel):
@@ -89,6 +93,44 @@ def _clip(text: str, limit: int = 220) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: max(1, limit - 1)] + "…"
+
+
+def _looks_like_clarification_answer(answer: str, notes: List[str]) -> bool:
+    lowered = answer.lower()
+    if "clarification_mode" in notes or "clarify_first_only" in notes:
+        return True
+    return (
+        "我先確認一件事" in answer
+        or "先確認" in answer
+        or "one quick check" in lowered
+        or "please confirm" in lowered
+    )
+
+
+def _looks_like_short_followup(query: str) -> bool:
+    compact = " ".join(query.strip().split())
+    if not compact:
+        return False
+    if len(compact) > 64:
+        return False
+    if REQUEST_LIKE_PATTERN.search(compact):
+        return False
+    return True
+
+
+def _merge_recent_user_queries(session_turns: List[ChatTurn], latest_query: str, max_queries: int = 3) -> str:
+    recent_user_queries = [turn.query.strip() for turn in session_turns[-max_queries:] if turn.query.strip()]
+    merged_parts: List[str] = []
+    seen: Set[str] = set()
+    for text in recent_user_queries:
+        norm = " ".join(text.split())
+        if norm and norm not in seen:
+            seen.add(norm)
+            merged_parts.append(norm)
+    latest_norm = " ".join(latest_query.strip().split())
+    if latest_norm and latest_norm not in seen:
+        merged_parts.append(latest_norm)
+    return "\n".join(merged_parts)
 
 
 def _build_history_context(
@@ -267,47 +309,60 @@ def chat(req: ChatRequest) -> ChatResponse:
     except Exception:
         policy_notes.append("memory_read_failed")
 
-    follow_up = resolve_follow_up_query(req.query, session_turns[-1] if session_turns else None)
-    if follow_up:
-        effective_query = follow_up.effective_query
-        preferred_language = follow_up.preferred_language
-        policy_notes.extend(follow_up.policy_notes)
-        if follow_up.mode == "need_option":
-            language = preferred_language or detect_query_language(effective_query)
-            answer = follow_up.clarify_message or (
-                "Please choose an option letter first." if language == "en" else "請先補上選項字母。"
-            )
-            body_tags = infer_body_tags(effective_query)
-            intent_tags = infer_intent_tags(effective_query)
+    use_followup_resolver = os.getenv("CHAT_USE_FOLLOWUP_RESOLVER", "0") == "1"
+    if use_followup_resolver:
+        follow_up = resolve_follow_up_query(req.query, session_turns[-1] if session_turns else None)
+        if follow_up:
+            effective_query = follow_up.effective_query
+            preferred_language = follow_up.preferred_language
+            policy_notes.extend(follow_up.policy_notes)
+            if follow_up.mode == "need_option":
+                language = preferred_language or detect_query_language(effective_query)
+                answer = follow_up.clarify_message or (
+                    "Please choose an option letter first." if language == "en" else "請先補上選項字母。"
+                )
+                body_tags = infer_body_tags(effective_query)
+                intent_tags = infer_intent_tags(effective_query)
 
-            try:
-                memory_store.add_turn(
+                try:
+                    memory_store.add_turn(
+                        user_id=user_id,
+                        session_id=session_id,
+                        query=req.query,
+                        answer=answer,
+                        policy_notes=policy_notes,
+                        references=[],
+                        body_tags=sorted(body_tags),
+                        intent_tags=sorted(intent_tags),
+                    )
+                except Exception:
+                    policy_notes.append("memory_write_failed")
+
+                return ChatResponse(
                     user_id=user_id,
                     session_id=session_id,
-                    query=req.query,
+                    history_turns_used=history_turns_used,
+                    effective_query=effective_query,
                     answer=answer,
+                    language=language,
                     policy_notes=policy_notes,
                     references=[],
                     body_tags=sorted(body_tags),
                     intent_tags=sorted(intent_tags),
+                    retrieved_chunks=[],
+                    videos=[],
                 )
-            except Exception:
-                policy_notes.append("memory_write_failed")
 
-            return ChatResponse(
-                user_id=user_id,
-                session_id=session_id,
-                history_turns_used=history_turns_used,
-                effective_query=effective_query,
-                answer=answer,
-                language=language,
-                policy_notes=policy_notes,
-                references=[],
-                body_tags=sorted(body_tags),
-                intent_tags=sorted(intent_tags),
-                retrieved_chunks=[],
-                videos=[],
-            )
+    # Natural-chat fallback: when previous assistant asked a clarification question and
+    # current user message is a short follow-up, merge recent user turns into one query
+    # so retrieval and slot detection do not reset each turn.
+    if session_turns:
+        last_turn = session_turns[-1]
+        if _looks_like_clarification_answer(last_turn.answer, last_turn.policy_notes) and _looks_like_short_followup(req.query):
+            merged_query = _merge_recent_user_queries(session_turns, req.query, max_queries=3)
+            if merged_query and merged_query != req.query:
+                effective_query = merged_query
+                policy_notes.append("contextual_followup_merge")
 
     try:
         result = rag.answer(

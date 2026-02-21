@@ -107,6 +107,18 @@ export default function Home() {
     }
   }
 
+  function onResetConversation() {
+    if (isSubmitting) return;
+    const nextUserId = makeId("user");
+    const nextSessionId = makeId("session");
+    localStorage.setItem(USER_ID_KEY, nextUserId);
+    localStorage.setItem(SESSION_ID_KEY, nextSessionId);
+    setUserId(nextUserId);
+    setSessionId(nextSessionId);
+    setQuery("");
+    setTurns([]);
+  }
+
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top,#dbeafe,transparent_50%),linear-gradient(180deg,#f8fafc,#eef2ff)] px-4 py-8 text-slate-900 md:px-8">
       <div className="mx-auto w-full max-w-7xl">
@@ -119,6 +131,14 @@ export default function Home() {
           <p className="mt-2 text-xs text-slate-500">
             session: {sessionId ? sessionId.slice(0, 16) : "initializing..."}
           </p>
+          <button
+            type="button"
+            onClick={onResetConversation}
+            disabled={isSubmitting}
+            className="mt-3 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Reset Conversation
+          </button>
         </header>
 
         <div className="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
@@ -208,7 +228,7 @@ export default function Home() {
                             ))}
                           </div>
                         )}
-                        {turn.response.policy_notes.length > 0 && (
+                        {SHOW_DEBUG_INFO && turn.response.policy_notes.length > 0 && (
                           <div className="mt-3 flex flex-wrap gap-2">
                             {turn.response.policy_notes.map((note) => (
                               <span key={note} className={chipClass("warn")}>

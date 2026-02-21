@@ -1,3 +1,4 @@
+import os
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -42,7 +43,8 @@ CHUNK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+_p\d+_c\d+")
 CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 DURATION_PATTERN = re.compile(
     r"\b\d+\s*(h|hr|hrs|hour|hours|day|days|week|weeks|month|months)\b|"
-    r"\d+\s*(小時|天|週|周|月)",
+    r"\d+\s*(小時|天|週|周|月)|"
+    r"(這幾天|最近|一陣子|幾天|幾週|幾周|幾個月|幾小時|持續性|間歇性|持續|間歇|反覆)",
     re.IGNORECASE,
 )
 SEVERITY_PATTERN = re.compile(
@@ -53,7 +55,7 @@ SEVERITY_PATTERN = re.compile(
 )
 TRIGGER_PATTERN = re.compile(
     r"\b(after|during|when|post|training|lifting|running|sitting|sleep|desk)\b|"
-    r"(運動後|訓練後|久坐|久站|睡前|睡覺|夜間|翻身|起床|工作後|抬手|彎腰|跑步後)",
+    r"(運動後|訓練後|久坐|久站|走路|步行|睡前|睡覺|夜間|翻身|起床|工作後|抬手|彎腰|跑步後|持續性|間歇性|持續|間歇)",
     re.IGNORECASE,
 )
 RED_FLAG_PATTERN = re.compile(
@@ -97,6 +99,10 @@ class RehabRAG:
         self.body_min_hits = max(0, body_min_hits)
         self.query_rewriter = query_rewriter if query_rewriter is not None else default_query_rewriter()
         self.rrf_k = max(1, rrf_k)
+        self.clarify_first_only = os.getenv("RAG_CLARIFY_FIRST_ONLY", "1") == "1"
+        self.clarification_mode = os.getenv("RAG_CLARIFICATION_MODE", "hybrid").strip().lower()
+        self.response_style = os.getenv("RAG_RESPONSE_STYLE", "natural").strip().lower()
+        self.retry_on_short = os.getenv("RAG_RETRY_SHORT_ANSWER", "1") == "1"
 
     def _retrieve_candidates(self, query: str, top_k: int) -> tuple[List[RetrievedChunk], List[str]]:
         notes: List[str] = []
@@ -192,9 +198,18 @@ class RehabRAG:
         if len(normalized) <= 6:
             return True
         slots = RehabRAG._extract_query_slots(query)
-        if slots["has_body"] and (slots["has_trigger"] or slots["has_duration"] or slots["has_severity"]):
-            return False
-        detail_score = sum([slots["has_body"], slots["has_duration"], slots["has_severity"], slots["has_trigger"]])
+        detail_score = sum([slots["has_duration"], slots["has_severity"], slots["has_trigger"], slots["has_red_flags"]])
+
+        # Body-only or body+single-detail often needs clarification before prescribing steps.
+        if slots["has_body"]:
+            if slots["has_red_flags"] and slots["has_severity"]:
+                return False
+            if slots["has_trigger"] and (slots["has_duration"] or slots["has_severity"]):
+                return False
+            if slots["has_duration"] and slots["has_severity"]:
+                return False
+            return True
+
         return detail_score <= 1
 
     def _apply_body_policy(
@@ -340,106 +355,173 @@ class RehabRAG:
 
     def _build_clarification_block(self, query: str, language: str) -> str:
         slots = self._extract_query_slots(query)
-        expected = self._infer_expected_body_tags(query)
-        body_hint = "肩頸/下背/手腕/膝踝" if language == "zh" else "neck-shoulder/lower back/wrist-knee-ankle"
-        if expected:
-            mapped: List[str] = []
-            if language == "zh":
-                if "body_neck_trap" in expected:
-                    mapped.append("肩頸")
-                if "body_back_spine" in expected:
-                    mapped.append("下背")
-                if "body_elbow_wrist_hand" in expected:
-                    mapped.append("手腕前臂")
-                if "body_shoulder" in expected:
-                    mapped.append("肩關節")
-                if "body_knee" in expected:
-                    mapped.append("膝")
-                if "body_ankle_foot" in expected:
-                    mapped.append("踝足")
-            else:
-                if "body_neck_trap" in expected:
-                    mapped.append("neck/trapezius")
-                if "body_back_spine" in expected:
-                    mapped.append("lower back/spine")
-                if "body_elbow_wrist_hand" in expected:
-                    mapped.append("wrist/forearm/hand")
-                if "body_shoulder" in expected:
-                    mapped.append("shoulder")
-                if "body_knee" in expected:
-                    mapped.append("knee")
-                if "body_ankle_foot" in expected:
-                    mapped.append("ankle/foot")
-            if mapped:
-                body_hint = "/".join(mapped)
-
-        questions: List[str] = []
-        if not slots["has_body"]:
-            if language == "zh":
-                questions.append(f"目前主要不舒服部位是？（A)肩頸 B)下背 C)手腕前臂 D)膝踝或腳）")
-            else:
-                questions.append(
-                    f"Where is the main discomfort? (A) neck-shoulder B) lower back C) wrist-forearm D) knee-ankle-foot)"
-                )
-
-        if not slots["has_trigger"]:
-            if language == "zh":
-                questions.append("什麼情境最容易誘發？（A)抬手/轉頭 B)彎腰/久坐 C)走路/訓練後 D)睡覺/翻身）")
-            else:
-                questions.append(
-                    "What triggers it most? (A) lifting/turning head B) bending/long sitting C) walking/after training D) during sleep/turning)"
-                )
-
-        if not slots["has_duration"]:
-            if language == "zh":
-                questions.append("已持續多久？（A)<24小時 B)24-72小時 C)>72小時 D)>2週）")
-            else:
-                questions.append("How long has it lasted? (A)<24h B)24-72h C)>72h D)>2 weeks)")
-
-        if not slots["has_severity"]:
-            if language == "zh":
-                questions.append("目前疼痛強度？（A)0-3 B)4-6 C)7-10）")
-            else:
-                questions.append("Current pain level? (A)0-3 B)4-6 C)7-10)")
-
-        if not slots["has_red_flags"]:
-            if language == "zh":
-                questions.append("是否有紅旗症狀？（A)麻木無力 B)夜間痛醒 C)發燒/胸痛/暈眩 D)以上皆無）")
-            else:
-                questions.append(
-                    "Any red-flag signs? (A) numbness/weakness B) night pain waking you C) fever/chest pain/dizziness D) none)"
-                )
-
-        # Keep clarification concise and avoid asking already-known slots.
-        if len(questions) > 2:
-            # Priority: body/trigger/duration/severity/red_flags
-            questions = questions[:2]
+        missing = self._missing_slots_for_prompt(slots)
+        target = missing[0] if missing else "trigger_situation"
 
         if language == "zh":
-            header = "先確認（只補你還沒提供的資訊，請回覆最接近選項）："
-            if not questions:
-                questions = [f"你不舒服的位置是否主要在「{body_hint}」？（A)是 B)否，請補充）"]
-            lines = [header] + [f"{idx}) {text}" for idx, text in enumerate(questions, start=1)]
-            return "\n".join(lines)
+            question_map = {
+                "body_location": "主要不舒服的位置在哪裡？（例如：右腳踝外側、下背中央、左肩前側）",
+                "trigger_situation": "什麼情境最容易痛？是走路、久坐後、彎腰、還是訓練後？",
+                "duration": "這個不適大概持續多久了？",
+                "severity": "目前疼痛大約幾分（0-10），以及會不會影響日常動作？",
+                "red_flag_check": "有沒有麻木無力、胸痛、發燒、暈眩或無法行走？",
+            }
+            question = question_map.get(target, question_map["trigger_situation"])
+            return (
+                f"我先確認一件事：{question}\n"
+                "若出現麻木無力、胸痛、暈眩、發燒或無法行走，請立即停止並就醫。"
+            )
 
-        header = "Please confirm only the missing details (choose the closest option):"
-        if not questions:
-            questions = [f"Is the main discomfort in \"{body_hint}\"? (A) yes B) no, specify location)"]
-        lines = [header] + [f"{idx}) {text}" for idx, text in enumerate(questions, start=1)]
-        return "\n".join(lines)
+        question_map_en = {
+            "body_location": "Where is the main discomfort exactly (for example: right outer ankle, central low back, left front shoulder)?",
+            "trigger_situation": "What most reliably triggers it: walking, long sitting, bending, or after training?",
+            "duration": "How long has this been going on?",
+            "severity": "What is the pain level now (0-10), and does it limit daily movement?",
+            "red_flag_check": "Any numbness/weakness, chest pain, fever, dizziness, or inability to walk?",
+        }
+        question = question_map_en.get(target, question_map_en["trigger_situation"])
+        return (
+            f"One quick check before I give a precise plan: {question}\n"
+            "Please answer in one sentence (no A/B format needed).\n"
+            "If numbness/weakness, chest pain, dizziness, fever, or inability to walk appears, stop and seek urgent care."
+        )
 
     def _ensure_clarification_block(self, answer: str, query: str, language: str) -> str:
         lowered = answer.lower()
         has_block = (
-            "先確認" in answer
-            or "你是不是" in answer
-            or "please confirm" in lowered
-            or "is the main discomfort" in lowered
+            "我先確認一件事" in answer
+            or "先確認" in answer
+            or "one quick check" in lowered
+            or "before i give a precise plan" in lowered
         )
         if has_block:
             return answer
         block = self._build_clarification_block(query, language=language)
         return f"{block}\n{answer}".strip()
+
+    def _build_clarify_first_response(self, query: str, language: str) -> str:
+        return self._build_clarification_block(query=query, language=language)
+
+    @staticmethod
+    def _missing_slots_for_prompt(slots: Dict[str, bool]) -> List[str]:
+        labels = [
+            ("has_body", "body_location"),
+            ("has_trigger", "trigger_situation"),
+            ("has_duration", "duration"),
+            ("has_severity", "severity"),
+            ("has_red_flags", "red_flag_check"),
+        ]
+        return [name for key, name in labels if not slots.get(key, False)]
+
+    def _build_dynamic_clarify_prompt(
+        self,
+        *,
+        query: str,
+        language: str,
+        slots: Dict[str, bool],
+        conversation_context: Optional[str],
+    ) -> str:
+        missing = ", ".join(self._missing_slots_for_prompt(slots)) or "none"
+        history = conversation_context if conversation_context else ("（無）" if language == "zh" else "(none)")
+        if language == "zh":
+            return (
+                "你現在在「釐清模式」，不要提供治療計畫。\n"
+                "任務：根據使用者原句與上下文，提出 1 題最關鍵追問，不要重問已知資訊。\n"
+                "已知欄位（true 代表已提供）：\n"
+                f"- body_location={slots.get('has_body', False)}\n"
+                f"- trigger_situation={slots.get('has_trigger', False)}\n"
+                f"- duration={slots.get('has_duration', False)}\n"
+                f"- severity={slots.get('has_severity', False)}\n"
+                f"- red_flag_check={slots.get('has_red_flags', False)}\n"
+                f"缺失欄位：{missing}\n\n"
+                "輸出限制：只輸出這三行，不要加編號、不要尖括號、不要多餘解釋：\n"
+                "我先確認一件事：<請改成你實際要問的問題，不要保留這段說明文字>\n"
+                "若出現麻木無力、胸痛、暈眩、發燒或無法行走，請立即停止並就醫。\n\n"
+                f"使用者原句：{query}\n"
+                f"歷史上下文：{history}"
+            )
+        return (
+            "You are in clarification-only mode. Do NOT provide a rehab plan yet.\n"
+            "Task: ask exactly one high-value follow-up question and do not re-ask known slots.\n"
+            "Known slots (true means provided):\n"
+            f"- body_location={slots.get('has_body', False)}\n"
+            f"- trigger_situation={slots.get('has_trigger', False)}\n"
+            f"- duration={slots.get('has_duration', False)}\n"
+            f"- severity={slots.get('has_severity', False)}\n"
+            f"- red_flag_check={slots.get('has_red_flags', False)}\n"
+            f"Missing slots: {missing}\n\n"
+            "Output restriction: only these 3 lines, no numbering, no angle brackets, no extra explanation:\n"
+            "One quick check before I give a precise plan: <replace with your actual question; do not keep this placeholder text>\n"
+            "Please answer in one sentence (no A/B format needed).\n"
+            "If numbness/weakness, chest pain, dizziness, fever, or inability to walk appears, stop and seek urgent care.\n\n"
+            f"User query: {query}\n"
+            f"History context: {history}"
+        )
+
+    @staticmethod
+    def _looks_like_clarify_response(text: str, language: str) -> bool:
+        t = text.strip()
+        if not t:
+            return False
+        if len(t) > 1200:
+            return False
+        if language == "zh":
+            if "確認" not in t and "問題" not in t:
+                return False
+            if "居家計畫" in t or "步驟 1" in t or "問題判讀" in t:
+                return False
+        else:
+            lowered = t.lower()
+            if "one quick check" not in lowered and "before i give a precise plan" not in lowered:
+                return False
+            if "home plan" in lowered or "step 1" in lowered or "problem interpretation" in lowered:
+                return False
+        return "?" in t or "？" in t
+
+    @staticmethod
+    def _is_repeated_clarify_question(text: str, conversation_context: Optional[str]) -> bool:
+        if not conversation_context:
+            return False
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        if not first_line:
+            return False
+        normalized = re.sub(r"\s+", " ", first_line).lower()
+        if len(normalized) < 8:
+            return False
+        context_norm = re.sub(r"\s+", " ", conversation_context).lower()
+        return normalized in context_norm
+
+    def _build_hybrid_clarify_response(
+        self,
+        *,
+        query: str,
+        language: str,
+        slots: Dict[str, bool],
+        conversation_context: Optional[str],
+    ) -> str:
+        if not self.llm_api:
+            return self._build_clarify_first_response(query=query, language=language)
+        prompt = self._build_dynamic_clarify_prompt(
+            query=query,
+            language=language,
+            slots=slots,
+            conversation_context=conversation_context,
+        )
+        try:
+            response = self.llm_api.generate(
+                prompt=prompt,
+                system=self.system_prompt,
+                temperature=0.0,
+                max_tokens=260,
+            )
+            text = response.text.strip()
+            if self._looks_like_clarify_response(text, language=language):
+                if self._is_repeated_clarify_question(text, conversation_context):
+                    return self._build_clarify_first_response(query=query, language=language)
+                return text
+        except Exception:
+            pass
+        return self._build_clarify_first_response(query=query, language=language)
 
     @staticmethod
     def _strip_unneeded_clarification_block(answer: str) -> str:
@@ -458,6 +540,15 @@ class RehabRAG:
             flags=re.IGNORECASE | re.DOTALL,
         )
         return stripped.strip()
+
+    @staticmethod
+    def _looks_like_truncated_answer(text: str) -> bool:
+        compact = " ".join(text.strip().split())
+        if len(compact) < 12:
+            return True
+        if compact.endswith(("我", "I", "I am", "好的，我", "Okay, I")):
+            return True
+        return False
 
     def _build_safety_fallback(self, language: str) -> str:
         if language == "zh":
@@ -488,6 +579,37 @@ class RehabRAG:
         language: str,
         conversation_context: Optional[str] = None,
     ) -> str:
+        if self.response_style == "natural":
+            if language == "zh":
+                return (
+                    "你是安全優先的居家復健助理。請用自然對話語氣，不要僵硬模板。\n"
+                    "規則：\n"
+                    "1) 只使用檢索證據，不可捏造。\n"
+                    "2) 先簡短回應使用者情境，再給可執行建議。\n"
+                    "3) 若資訊不足，最多補問 1 個最關鍵問題，不要一次連問多題。\n"
+                    "4) 建議必須包含停止條件；有紅旗症狀時要明確就醫。\n"
+                    "5) 重要建議後加上 chunk_id 引用（`[chunk_id]`），最後列 References。\n"
+                    "6) 不要輸出固定章節標題（例如 1)問題判讀 2)安全提醒）。\n\n"
+                    f"查詢狀態：vague_query={'yes' if is_vague_query else 'no'}\n"
+                    f"歷史上下文：\n{conversation_context if conversation_context else '（無）'}\n\n"
+                    f"使用者問題：\n{query}\n\n"
+                    f"檢索內容：\n{context_text if context_text else '（無檢索結果）'}"
+                )
+            return (
+                "You are a safety-first home rehab assistant. Use a natural conversational style.\n"
+                "Rules:\n"
+                "1) Use retrieved evidence only; do not invent details.\n"
+                "2) Briefly reflect the user's situation, then give actionable advice.\n"
+                "3) If information is missing, ask at most one key follow-up question.\n"
+                "4) Include stop conditions; clearly advise medical care for red flags.\n"
+                "5) Add chunk citations (`[chunk_id]`) near key recommendations and end with References.\n"
+                "6) Do not use rigid section templates like '1) Problem interpretation'.\n\n"
+                f"Query state: vague_query={'yes' if is_vague_query else 'no'}\n"
+                f"History context:\n{conversation_context if conversation_context else '(none)'}\n\n"
+                f"User query:\n{query}\n\n"
+                f"Retrieved evidence:\n{context_text if context_text else '(no retrieval results)'}"
+            )
+
         if language == "zh":
             clarification_rules = (
                 "釐清規則：\n"
@@ -590,6 +712,28 @@ class RehabRAG:
             policy_notes.append("insufficient_evidence_gate")
             fallback_answer = self._build_safety_fallback(query_language)
             return RAGResult(answer=fallback_answer, retrieved=chunks, context_text=context_text, policy_notes=policy_notes)
+
+        if is_vague_query and self.clarify_first_only:
+            policy_notes.append("clarify_first_only")
+            slots = self._extract_query_slots(query)
+            if self.clarification_mode == "hybrid":
+                policy_notes.append("clarification_mode_hybrid")
+                clarify_answer = self._build_hybrid_clarify_response(
+                    query=query,
+                    language=query_language,
+                    slots=slots,
+                    conversation_context=conversation_context,
+                )
+            else:
+                policy_notes.append("clarification_mode_template")
+                clarify_answer = self._build_clarify_first_response(query=query, language=query_language)
+            return RAGResult(
+                answer=clarify_answer,
+                retrieved=chunks,
+                context_text=context_text,
+                policy_notes=policy_notes,
+            )
+
         user_prompt = self._build_user_prompt(
             query=query,
             context_text=context_text,
@@ -605,8 +749,24 @@ class RehabRAG:
             max_tokens=max_tokens,
         )
         final_answer = response.text
+        if self.retry_on_short and self._looks_like_truncated_answer(final_answer):
+            retry_prompt = (
+                f"{user_prompt}\n\n"
+                "上一版回覆過短或被截斷。"
+                "請完整回覆，不要只輸出開頭句。"
+            )
+            retry = self.llm_api.generate(
+                prompt=retry_prompt,
+                system=self.system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            if not self._looks_like_truncated_answer(retry.text):
+                final_answer = retry.text
+                policy_notes.append("retry_short_answer")
         if is_vague_query:
-            final_answer = self._ensure_clarification_block(final_answer, query, language=query_language)
+            if self.response_style != "natural":
+                final_answer = self._ensure_clarification_block(final_answer, query, language=query_language)
         else:
             cleaned = self._strip_unneeded_clarification_block(final_answer)
             if cleaned != final_answer:
