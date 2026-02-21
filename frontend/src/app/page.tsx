@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { ChatResponse, chatWithBackend } from "@/lib/api";
 
 type ChatTurn = {
@@ -22,12 +22,36 @@ function scoreLabel(score: number): string {
   return score.toFixed(3);
 }
 
+const USER_ID_KEY = "rehabcompass_user_id";
+const SESSION_ID_KEY = "rehabcompass_session_id";
+const SHOW_DEBUG_INFO = process.env.NEXT_PUBLIC_SHOW_DEBUG_INFO === "1";
+
+function makeId(prefix: string): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`;
+  }
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export default function Home() {
   const [query, setQuery] = useState("");
   const [topK, setTopK] = useState(8);
   const [videoLimit, setVideoLimit] = useState(3);
   const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [userId, setUserId] = useState("");
+  const [sessionId, setSessionId] = useState("");
+
+  useEffect(() => {
+    const storedUserId = localStorage.getItem(USER_ID_KEY);
+    const storedSessionId = localStorage.getItem(SESSION_ID_KEY);
+    const nextUserId = storedUserId || makeId("user");
+    const nextSessionId = storedSessionId || makeId("session");
+    localStorage.setItem(USER_ID_KEY, nextUserId);
+    localStorage.setItem(SESSION_ID_KEY, nextSessionId);
+    setUserId(nextUserId);
+    setSessionId(nextSessionId);
+  }, []);
 
   const latestResponse = useMemo(
     () => turns.find((turn) => turn.response)?.response,
@@ -45,13 +69,26 @@ export default function Home() {
     setQuery("");
 
     try {
+      const activeUserId = userId || makeId("user");
+      const activeSessionId = sessionId || makeId("session");
       const response = await chatWithBackend({
         query: trimmed,
         top_k: topK,
         video_limit: videoLimit,
         temperature: 0,
         max_tokens: 450,
+        user_id: activeUserId,
+        session_id: activeSessionId,
       });
+
+      if (response.user_id && response.user_id !== userId) {
+        setUserId(response.user_id);
+        localStorage.setItem(USER_ID_KEY, response.user_id);
+      }
+      if (response.session_id && response.session_id !== sessionId) {
+        setSessionId(response.session_id);
+        localStorage.setItem(SESSION_ID_KEY, response.session_id);
+      }
 
       setTurns((prev) =>
         prev.map((turn) =>
@@ -78,6 +115,9 @@ export default function Home() {
           <h1 className="mt-2 text-2xl font-semibold tracking-tight md:text-3xl">Exercise, Rehab &amp; Stretch Guide</h1>
           <p className="mt-2 text-sm text-slate-600">
             描述你的不適與情境，我會提供安全優先的分步建議、停止/就醫警訊，並推薦可跟做的復健影片與參考來源。
+          </p>
+          <p className="mt-2 text-xs text-slate-500">
+            session: {sessionId ? sessionId.slice(0, 16) : "initializing..."}
           </p>
         </header>
 
@@ -153,6 +193,11 @@ export default function Home() {
                     )}
                     {turn.response && (
                       <>
+                        {SHOW_DEBUG_INFO && turn.response.effective_query !== turn.query && (
+                          <p className="mt-2 text-xs text-slate-500">
+                            Context-expanded query: {turn.response.effective_query}
+                          </p>
+                        )}
                         <p className="mt-2 whitespace-pre-wrap text-sm leading-6">{turn.response.answer}</p>
                         {turn.response.references.length > 0 && (
                           <div className="mt-3 flex flex-wrap gap-2">
@@ -171,6 +216,11 @@ export default function Home() {
                               </span>
                             ))}
                           </div>
+                        )}
+                        {SHOW_DEBUG_INFO && turn.response.history_turns_used > 0 && (
+                          <p className="mt-2 text-xs text-slate-500">
+                            history turns used: {turn.response.history_turns_used}
+                          </p>
                         )}
                       </>
                     )}

@@ -10,6 +10,7 @@ This folder gives you a minimal local stack for:
   - `backend/api/`: FastAPI service
   - `backend/llm_api/`: vLLM client wrapper
   - `backend/rag/`: retrieval/ranking pipeline
+  - `backend/memory/`: session and long-term chat memory store
   - `backend/recommendation/`: video recommendation providers
 - `scripts/`: CLI utilities for data build / eval / local tests
 - `bin/`: runnable shell entrypoints
@@ -108,6 +109,20 @@ curl -X POST http://localhost:9000/v1/chat \
   -H "Content-Type: application/json" \
   -d '{
     "query":"我背部有點痠痛，請給我建議並推薦影片",
+    "top_k":8,
+    "video_limit":3
+  }'
+```
+
+With memory-enabled chat IDs:
+
+```bash
+curl -X POST http://localhost:9000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query":"我背部有點痠痛，請給我建議並推薦影片",
+    "user_id":"user_demo_001",
+    "session_id":"session_demo_20260221",
     "top_k":8,
     "video_limit":3
   }'

@@ -26,6 +26,7 @@ npm run dev
 ## Features
 
 - Send rehab query to `POST /v1/chat`
+- Persist `user_id` and `session_id` in browser `localStorage` for chat memory
 - Show answer with policy notes and chunk references
 - Show retrieved evidence chunks
 - Show recommended videos from backend

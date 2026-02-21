@@ -31,7 +31,10 @@ BODY_HINT_PATTERNS: Dict[str, re.Pattern[str]] = {
     "body_neck_trap": re.compile(r"\b(neck|cervical|trapezius)\b|頸|肩頸|斜方肌", re.IGNORECASE),
     "body_back_spine": re.compile(r"\b(back|lumbar|thoracic|spine|low back)\b|背|腰|脊椎|下背", re.IGNORECASE),
     "body_knee": re.compile(r"\b(knee|patella|meniscus)\b|膝|膝蓋|半月板", re.IGNORECASE),
-    "body_ankle_foot": re.compile(r"\b(ankle|foot|achilles|plantar)\b|踝|腳踝|足底|跟腱", re.IGNORECASE),
+    "body_ankle_foot": re.compile(
+        r"\b(ankle|foot|heel|achilles|plantar)\b|踝|腳踝|腳跟|足底|足弓|跟腱|腳",
+        re.IGNORECASE,
+    ),
     "body_hip_glute": re.compile(r"\b(hip|glute|buttock)\b|髖|臀|臀肌", re.IGNORECASE),
     "body_elbow_wrist_hand": re.compile(r"\b(elbow|wrist|forearm|hand)\b|手肘|手腕|前臂|手", re.IGNORECASE),
 }
@@ -50,7 +53,12 @@ SEVERITY_PATTERN = re.compile(
 )
 TRIGGER_PATTERN = re.compile(
     r"\b(after|during|when|post|training|lifting|running|sitting|sleep|desk)\b|"
-    r"(運動後|訓練後|久坐|久站|睡前|起床|工作後|抬手|彎腰|跑步後)",
+    r"(運動後|訓練後|久坐|久站|睡前|睡覺|夜間|翻身|起床|工作後|抬手|彎腰|跑步後)",
+    re.IGNORECASE,
+)
+RED_FLAG_PATTERN = re.compile(
+    r"\b(numbness|weakness|chest pain|dizziness|fever|night pain|cannot walk|unable to walk)\b|"
+    r"(麻木|無力|胸痛|暈眩|發燒|夜間痛|無法行走|走不了)",
     re.IGNORECASE,
 )
 
@@ -164,15 +172,29 @@ class RehabRAG:
         return "zh" if CJK_PATTERN.search(query) else "en"
 
     @staticmethod
-    def _is_query_vague(query: str) -> bool:
-        normalized = " ".join(query.strip().split())
-        if len(normalized) <= 10:
-            return True
+    def _extract_query_slots(query: str) -> Dict[str, bool]:
         has_body = bool(RehabRAG._infer_expected_body_tags(query))
         has_duration = bool(DURATION_PATTERN.search(query))
         has_severity = bool(SEVERITY_PATTERN.search(query))
         has_trigger = bool(TRIGGER_PATTERN.search(query))
-        detail_score = sum([has_body, has_duration, has_severity, has_trigger])
+        has_red_flags = bool(RED_FLAG_PATTERN.search(query))
+        return {
+            "has_body": has_body,
+            "has_duration": has_duration,
+            "has_severity": has_severity,
+            "has_trigger": has_trigger,
+            "has_red_flags": has_red_flags,
+        }
+
+    @staticmethod
+    def _is_query_vague(query: str) -> bool:
+        normalized = " ".join(query.strip().split())
+        if len(normalized) <= 6:
+            return True
+        slots = RehabRAG._extract_query_slots(query)
+        if slots["has_body"] and (slots["has_trigger"] or slots["has_duration"] or slots["has_severity"]):
+            return False
+        detail_score = sum([slots["has_body"], slots["has_duration"], slots["has_severity"], slots["has_trigger"]])
         return detail_score <= 1
 
     def _apply_body_policy(
@@ -317,11 +339,9 @@ class RehabRAG:
         return answer.rstrip() + appended
 
     def _build_clarification_block(self, query: str, language: str) -> str:
+        slots = self._extract_query_slots(query)
         expected = self._infer_expected_body_tags(query)
-        if language == "zh":
-            body_hint = "肩頸/下背/手腕/膝踝"
-        else:
-            body_hint = "neck-shoulder/lower back/wrist-knee-ankle"
+        body_hint = "肩頸/下背/手腕/膝踝" if language == "zh" else "neck-shoulder/lower back/wrist-knee-ankle"
         if expected:
             mapped: List[str] = []
             if language == "zh":
@@ -353,20 +373,60 @@ class RehabRAG:
             if mapped:
                 body_hint = "/".join(mapped)
 
-        if language == "zh":
-            return (
-                "先確認（為了給你更精準的動作處方，請回覆最接近選項）：\n"
-                f"1) 你是不是主要在「{body_hint}」不舒服？（A是 B不是，請補充部位）\n"
-                "2) 你是不是在特定動作才會痛？（A抬手/轉頭 B彎腰/久坐後 C走路/訓練後 D都會）\n"
-                "3) 你是不是有以下任一狀況？（A麻木無力 B夜間痛醒 C發燒/胸痛/暈眩 D以上皆無）\n"
-            )
+        questions: List[str] = []
+        if not slots["has_body"]:
+            if language == "zh":
+                questions.append(f"目前主要不舒服部位是？（A)肩頸 B)下背 C)手腕前臂 D)膝踝或腳）")
+            else:
+                questions.append(
+                    f"Where is the main discomfort? (A) neck-shoulder B) lower back C) wrist-forearm D) knee-ankle-foot)"
+                )
 
-        return (
-            "Please confirm first (to provide a precise plan, choose the closest option):\n"
-            f"1) Is the main discomfort in \"{body_hint}\"? (A yes B no, specify location)\n"
-            "2) Is pain triggered by specific movements? (A lifting/turning head B bending/long sitting C walking/training D all)\n"
-            "3) Any of these signs? (A numbness/weakness B night pain waking you up C fever/chest pain/dizziness D none)\n"
-        )
+        if not slots["has_trigger"]:
+            if language == "zh":
+                questions.append("什麼情境最容易誘發？（A)抬手/轉頭 B)彎腰/久坐 C)走路/訓練後 D)睡覺/翻身）")
+            else:
+                questions.append(
+                    "What triggers it most? (A) lifting/turning head B) bending/long sitting C) walking/after training D) during sleep/turning)"
+                )
+
+        if not slots["has_duration"]:
+            if language == "zh":
+                questions.append("已持續多久？（A)<24小時 B)24-72小時 C)>72小時 D)>2週）")
+            else:
+                questions.append("How long has it lasted? (A)<24h B)24-72h C)>72h D)>2 weeks)")
+
+        if not slots["has_severity"]:
+            if language == "zh":
+                questions.append("目前疼痛強度？（A)0-3 B)4-6 C)7-10）")
+            else:
+                questions.append("Current pain level? (A)0-3 B)4-6 C)7-10)")
+
+        if not slots["has_red_flags"]:
+            if language == "zh":
+                questions.append("是否有紅旗症狀？（A)麻木無力 B)夜間痛醒 C)發燒/胸痛/暈眩 D)以上皆無）")
+            else:
+                questions.append(
+                    "Any red-flag signs? (A) numbness/weakness B) night pain waking you C) fever/chest pain/dizziness D) none)"
+                )
+
+        # Keep clarification concise and avoid asking already-known slots.
+        if len(questions) > 2:
+            # Priority: body/trigger/duration/severity/red_flags
+            questions = questions[:2]
+
+        if language == "zh":
+            header = "先確認（只補你還沒提供的資訊，請回覆最接近選項）："
+            if not questions:
+                questions = [f"你不舒服的位置是否主要在「{body_hint}」？（A)是 B)否，請補充）"]
+            lines = [header] + [f"{idx}) {text}" for idx, text in enumerate(questions, start=1)]
+            return "\n".join(lines)
+
+        header = "Please confirm only the missing details (choose the closest option):"
+        if not questions:
+            questions = [f"Is the main discomfort in \"{body_hint}\"? (A) yes B) no, specify location)"]
+        lines = [header] + [f"{idx}) {text}" for idx, text in enumerate(questions, start=1)]
+        return "\n".join(lines)
 
     def _ensure_clarification_block(self, answer: str, query: str, language: str) -> str:
         lowered = answer.lower()
@@ -380,6 +440,24 @@ class RehabRAG:
             return answer
         block = self._build_clarification_block(query, language=language)
         return f"{block}\n{answer}".strip()
+
+    @staticmethod
+    def _strip_unneeded_clarification_block(answer: str) -> str:
+        stripped = answer
+        # Remove common leading clarification sections when the query is already specific.
+        stripped = re.sub(
+            r"先確認.*?(?=(?:\n\s*1\)\s*問題判讀|\n\s*問題判讀|$))",
+            "",
+            stripped,
+            flags=re.DOTALL,
+        )
+        stripped = re.sub(
+            r"Please confirm.*?(?=(?:\n\s*1\)\s*Problem interpretation|\n\s*Problem interpretation|$))",
+            "",
+            stripped,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return stripped.strip()
 
     def _build_safety_fallback(self, language: str) -> str:
         if language == "zh":
@@ -402,13 +480,22 @@ class RehabRAG:
             "Then I will provide a more precise home-rehab flow."
         )
 
-    def _build_user_prompt(self, query: str, context_text: str, is_vague_query: bool, language: str) -> str:
+    def _build_user_prompt(
+        self,
+        query: str,
+        context_text: str,
+        is_vague_query: bool,
+        language: str,
+        conversation_context: Optional[str] = None,
+    ) -> str:
         if language == "zh":
             clarification_rules = (
                 "釐清規則：\n"
                 "A) 若問題描述模糊，先輸出 `先確認` 區塊，提出 2-3 個「你是不是...」封閉式問題（A/B/C）。\n"
                 "B) 即使先確認，也要給低風險暫行方案（2-3步），直到使用者補充資訊。\n"
                 "C) 若資訊足夠，直接給完整計畫，不要再追問。\n"
+                "D) 若使用者已提供部位或情境，禁止重複追問同欄位。\n"
+                "E) 當 vague_query=no 時，禁止輸出 `先確認`。\n"
             )
             response_template = (
                 "回覆格式（依序）：\n"
@@ -430,6 +517,7 @@ class RehabRAG:
                 f"{clarification_rules}\n"
                 f"{response_template}\n"
                 f"此次查詢狀態：vague_query={'yes' if is_vague_query else 'no'}。\n"
+                f"使用者歷史上下文：\n{conversation_context if conversation_context else '（無）'}\n\n"
                 f"使用者問題：\n{query}\n\n"
                 f"檢索內容：\n{context_text if context_text else '（無檢索結果）'}"
             )
@@ -439,6 +527,8 @@ class RehabRAG:
             "A) If the query is vague, output a `Please confirm` block with 2-3 targeted closed questions (A/B/C).\n"
             "B) Even when asking clarification, provide a low-risk temporary 2-3 step plan.\n"
             "C) If information is sufficient, provide a full plan directly.\n"
+            "D) Do not re-ask slots already provided by the user.\n"
+            "E) When vague_query=no, do not output `Please confirm`.\n"
         )
         response_template = (
             "Response structure (in order):\n"
@@ -461,11 +551,20 @@ class RehabRAG:
             f"{clarification_rules}\n"
             f"{response_template}\n"
             f"Query state: vague_query={'yes' if is_vague_query else 'no'}.\n"
+            f"User history context:\n{conversation_context if conversation_context else '(none)'}\n\n"
             f"User query:\n{query}\n\n"
             f"Retrieved evidence:\n{context_text if context_text else '(no retrieval results)'}"
         )
 
-    def answer(self, query: str, top_k: int = 5, temperature: float = 0.2, max_tokens: int = 512) -> RAGResult:
+    def answer(
+        self,
+        query: str,
+        top_k: int = 5,
+        temperature: float = 0.2,
+        max_tokens: int = 512,
+        conversation_context: Optional[str] = None,
+        preferred_language: Optional[str] = None,
+    ) -> RAGResult:
         retrieval_k = max(top_k, self.candidate_pool)
         base_hits, rewrite_notes = self._retrieve_candidates(query=query, top_k=retrieval_k)
         body_hits, body_notes = self._apply_body_policy(query=query, hits=base_hits, top_k=top_k)
@@ -480,7 +579,7 @@ class RehabRAG:
         )
         has_safety = bool(tags_all & SAFETY_TAGS)
         is_vague_query = self._is_query_vague(query)
-        query_language = self._detect_query_language(query)
+        query_language = preferred_language if preferred_language in {"zh", "en"} else self._detect_query_language(query)
         if is_vague_query:
             policy_notes.append("clarification_mode")
 
@@ -496,6 +595,7 @@ class RehabRAG:
             context_text=context_text,
             is_vague_query=is_vague_query,
             language=query_language,
+            conversation_context=conversation_context,
         )
 
         response = self.llm_api.generate(
@@ -507,6 +607,11 @@ class RehabRAG:
         final_answer = response.text
         if is_vague_query:
             final_answer = self._ensure_clarification_block(final_answer, query, language=query_language)
+        else:
+            cleaned = self._strip_unneeded_clarification_block(final_answer)
+            if cleaned != final_answer:
+                policy_notes.append("removed_unneeded_clarification")
+            final_answer = cleaned
         final_answer = self._ensure_reference_block(final_answer, chunks)
 
         return RAGResult(

@@ -2,12 +2,20 @@ import os
 import re
 from functools import lru_cache
 from typing import List, Optional, Set
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend.llm_api import create_vllm_api
+from backend.memory import (
+    ChatMemoryStore,
+    ChatTurn,
+    NullMemoryStore,
+    SQLiteChatMemoryStore,
+    resolve_follow_up_query,
+)
 from backend.rag import BM25Retriever, RehabRAG, RetrievedChunk
 from backend.recommendation import (
     CatalogVideoProvider,
@@ -31,6 +39,8 @@ class ChatRequest(BaseModel):
     video_limit: int = Field(default=3, ge=0, le=10)
     temperature: float = Field(default=0.0, ge=0.0, le=1.5)
     max_tokens: int = Field(default=450, ge=64, le=2048)
+    user_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    session_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
 
 
 class RetrievedChunkOut(BaseModel):
@@ -56,6 +66,10 @@ class VideoOut(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    user_id: str
+    session_id: str
+    history_turns_used: int
+    effective_query: str
     answer: str
     language: str
     policy_notes: List[str]
@@ -68,6 +82,44 @@ class ChatResponse(BaseModel):
 
 def _extract_chunk_refs(text: str) -> List[str]:
     return sorted(set(CHUNK_ID_PATTERN.findall(text)))
+
+
+def _clip(text: str, limit: int = 220) -> str:
+    compact = " ".join(text.strip().split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(1, limit - 1)] + "…"
+
+
+def _build_history_context(
+    *,
+    session_turns: List[ChatTurn],
+    user_turns: List[ChatTurn],
+    max_chars: int = 1800,
+) -> Optional[str]:
+    if not session_turns and not user_turns:
+        return None
+
+    lines: List[str] = []
+
+    if session_turns:
+        lines.append("Current session history:")
+        for idx, turn in enumerate(session_turns[-4:], start=1):
+            lines.append(f"- S{idx} User: {_clip(turn.query, 200)}")
+            lines.append(f"  S{idx} Assistant: {_clip(turn.answer, 260)}")
+
+    if user_turns:
+        lines.append("User long-term history from previous sessions:")
+        for idx, turn in enumerate(user_turns[-4:], start=1):
+            lines.append(
+                f"- U{idx} ({turn.session_id}) User: {_clip(turn.query, 160)} | "
+                f"Assistant: {_clip(turn.answer, 200)}"
+            )
+
+    context = "\n".join(lines).strip()
+    if len(context) > max_chars:
+        context = context[: max_chars - 1] + "…"
+    return context
 
 
 def _chunk_to_out(chunk: RetrievedChunk) -> RetrievedChunkOut:
@@ -115,8 +167,20 @@ def _build_video_recommender() -> VideoRecommender:
     return VideoRecommender(providers)
 
 
+def _build_memory_store() -> ChatMemoryStore:
+    if os.getenv("CHAT_MEMORY_ENABLED", "1") != "1":
+        return NullMemoryStore()
+
+    backend = os.getenv("CHAT_MEMORY_BACKEND", "sqlite").strip().lower()
+    if backend == "sqlite":
+        db_path = os.getenv("CHAT_MEMORY_SQLITE_PATH", "artifacts/memory/chat_memory.sqlite3")
+        return SQLiteChatMemoryStore(db_path=db_path)
+
+    raise RuntimeError(f"Unsupported CHAT_MEMORY_BACKEND: {backend}")
+
+
 @lru_cache(maxsize=1)
-def _bootstrap() -> tuple[RehabRAG, VideoRecommender]:
+def _bootstrap() -> tuple[RehabRAG, VideoRecommender, ChatMemoryStore]:
     index_path = os.getenv("RAG_INDEX_INPUT", "artifacts/rag/bm25_index.pkl")
     canonical_path = os.getenv("RAG_CANONICAL_INPUT", "data/canonical_docs.jsonl")
 
@@ -138,7 +202,8 @@ def _bootstrap() -> tuple[RehabRAG, VideoRecommender]:
         body_min_hits=int(os.getenv("RAG_BODY_MIN_HITS", "2")),
     )
     video_recommender = _build_video_recommender()
-    return rag, video_recommender
+    memory_store = _build_memory_store()
+    return rag, video_recommender, memory_store
 
 
 app = FastAPI(title="MedGemma Rehab API", version="0.1.0")
@@ -156,7 +221,7 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict:
     try:
-        rag, _ = _bootstrap()
+        rag, _, _ = _bootstrap()
         ok = rag.llm_api.health_check() if rag.llm_api else False
         return {"ok": bool(ok)}
     except Exception as e:
@@ -166,45 +231,140 @@ def health() -> dict:
 @app.post("/v1/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     try:
-        rag, video_recommender = _bootstrap()
+        rag, video_recommender, memory_store = _bootstrap()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Bootstrap failed: {e}") from e
 
     if not rag.llm_api or not rag.llm_api.health_check():
         raise HTTPException(status_code=503, detail="vLLM server is unavailable.")
 
+    user_id = req.user_id.strip() if req.user_id and req.user_id.strip() else f"user_{uuid4().hex}"
+    session_id = req.session_id.strip() if req.session_id and req.session_id.strip() else f"session_{uuid4().hex}"
+
+    policy_notes: List[str] = []
+    history_context: Optional[str] = None
+    history_turns_used = 0
+    session_turns: List[ChatTurn] = []
+    effective_query = req.query
+    preferred_language: Optional[str] = None
+
+    try:
+        session_turns = memory_store.get_recent_session_turns(
+            session_id=session_id,
+            limit=max(1, int(os.getenv("CHAT_MEMORY_SESSION_LIMIT", "6"))),
+        )
+        long_term_turns = memory_store.get_recent_user_turns(
+            user_id=user_id,
+            limit=max(1, int(os.getenv("CHAT_MEMORY_LONG_TERM_LIMIT", "4"))),
+            exclude_session_id=session_id,
+        )
+        history_turns_used = len(session_turns) + len(long_term_turns)
+        history_context = _build_history_context(
+            session_turns=session_turns,
+            user_turns=long_term_turns,
+            max_chars=max(500, int(os.getenv("CHAT_MEMORY_CONTEXT_MAX_CHARS", "1800"))),
+        )
+    except Exception:
+        policy_notes.append("memory_read_failed")
+
+    follow_up = resolve_follow_up_query(req.query, session_turns[-1] if session_turns else None)
+    if follow_up:
+        effective_query = follow_up.effective_query
+        preferred_language = follow_up.preferred_language
+        policy_notes.extend(follow_up.policy_notes)
+        if follow_up.mode == "need_option":
+            language = preferred_language or detect_query_language(effective_query)
+            answer = follow_up.clarify_message or (
+                "Please choose an option letter first." if language == "en" else "請先補上選項字母。"
+            )
+            body_tags = infer_body_tags(effective_query)
+            intent_tags = infer_intent_tags(effective_query)
+
+            try:
+                memory_store.add_turn(
+                    user_id=user_id,
+                    session_id=session_id,
+                    query=req.query,
+                    answer=answer,
+                    policy_notes=policy_notes,
+                    references=[],
+                    body_tags=sorted(body_tags),
+                    intent_tags=sorted(intent_tags),
+                )
+            except Exception:
+                policy_notes.append("memory_write_failed")
+
+            return ChatResponse(
+                user_id=user_id,
+                session_id=session_id,
+                history_turns_used=history_turns_used,
+                effective_query=effective_query,
+                answer=answer,
+                language=language,
+                policy_notes=policy_notes,
+                references=[],
+                body_tags=sorted(body_tags),
+                intent_tags=sorted(intent_tags),
+                retrieved_chunks=[],
+                videos=[],
+            )
+
     try:
         result = rag.answer(
-            query=req.query,
+            query=effective_query,
             top_k=req.top_k,
             temperature=req.temperature,
             max_tokens=req.max_tokens,
+            conversation_context=history_context,
+            preferred_language=preferred_language,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RAG answer failed: {e}") from e
 
-    language = detect_query_language(req.query)
+    policy_notes.extend(result.policy_notes)
+    language = preferred_language or detect_query_language(effective_query)
+
     rag_body_tags: Set[str] = set()
     for chunk in result.retrieved:
         for tag in chunk.tags:
             if tag.startswith("body_"):
                 rag_body_tags.add(tag)
 
-    body_tags = infer_body_tags(req.query) | rag_body_tags
-    intent_tags = infer_intent_tags(req.query)
+    body_tags = infer_body_tags(effective_query) | rag_body_tags
+    intent_tags = infer_intent_tags(effective_query)
+    references = _extract_chunk_refs(result.answer)
+
     videos = video_recommender.recommend(
-        query=req.query,
+        query=effective_query,
         body_tags=body_tags,
         intent_tags=intent_tags,
         language=language,
         limit=req.video_limit,
     )
 
+    try:
+        memory_store.add_turn(
+            user_id=user_id,
+            session_id=session_id,
+            query=req.query,
+            answer=result.answer,
+            policy_notes=policy_notes,
+            references=references,
+            body_tags=sorted(body_tags),
+            intent_tags=sorted(intent_tags),
+        )
+    except Exception:
+        policy_notes.append("memory_write_failed")
+
     return ChatResponse(
+        user_id=user_id,
+        session_id=session_id,
+        history_turns_used=history_turns_used,
+        effective_query=effective_query,
         answer=result.answer,
         language=language,
-        policy_notes=result.policy_notes,
-        references=_extract_chunk_refs(result.answer),
+        policy_notes=policy_notes,
+        references=references,
         body_tags=sorted(body_tags),
         intent_tags=sorted(intent_tags),
         retrieved_chunks=[_chunk_to_out(c) for c in result.retrieved],

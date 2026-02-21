@@ -21,6 +21,10 @@ export type VideoCandidate = {
 };
 
 export type ChatResponse = {
+  user_id: string;
+  session_id: string;
+  history_turns_used: number;
+  effective_query: string;
   answer: string;
   language: string;
   policy_notes: string[];
@@ -37,6 +41,8 @@ export type ChatPayload = {
   video_limit?: number;
   temperature?: number;
   max_tokens?: number;
+  user_id?: string;
+  session_id?: string;
 };
 
 function getApiBaseUrl(): string {
