@@ -23,12 +23,14 @@ export type VideoCandidate = {
 export type ChatResponse = {
   user_id: string;
   session_id: string;
+  episode_id?: string | null;
   history_turns_used: number;
   effective_query: string;
   answer: string;
   language: string;
   policy_notes: string[];
   references: string[];
+  episode_slots: Record<string, string>;
   body_tags: string[];
   intent_tags: string[];
   retrieved_chunks: RetrievedChunk[];

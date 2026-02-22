@@ -14,7 +14,12 @@ from backend.memory import (
     ChatTurn,
     NullMemoryStore,
     SQLiteChatMemoryStore,
+    build_episode_context,
+    detect_body_bucket,
+    extract_slot_updates,
+    has_minimum_slots_for_plan,
     resolve_follow_up_query,
+    should_start_new_episode,
 )
 from backend.rag import BM25Retriever, RehabRAG, RetrievedChunk
 from backend.recommendation import (
@@ -72,12 +77,14 @@ class VideoOut(BaseModel):
 class ChatResponse(BaseModel):
     user_id: str
     session_id: str
+    episode_id: Optional[str] = None
     history_turns_used: int
     effective_query: str
     answer: str
     language: str
     policy_notes: List[str]
     references: List[str]
+    episode_slots: dict[str, str]
     body_tags: List[str]
     intent_tags: List[str]
     retrieved_chunks: List[RetrievedChunkOut]
@@ -144,11 +151,14 @@ def _build_history_context(
 
     lines: List[str] = []
 
+    include_assistant = os.getenv("CHAT_HISTORY_INCLUDE_ASSISTANT", "0") == "1"
+
     if session_turns:
         lines.append("Current session history:")
         for idx, turn in enumerate(session_turns[-4:], start=1):
             lines.append(f"- S{idx} User: {_clip(turn.query, 200)}")
-            lines.append(f"  S{idx} Assistant: {_clip(turn.answer, 260)}")
+            if include_assistant:
+                lines.append(f"  S{idx} Assistant: {_clip(turn.answer, 260)}")
 
     if user_turns:
         lines.append("User long-term history from previous sessions:")
@@ -162,6 +172,12 @@ def _build_history_context(
     if len(context) > max_chars:
         context = context[: max_chars - 1] + "…"
     return context
+
+
+def _filter_turns_by_episode(turns: List[ChatTurn], episode_id: Optional[str]) -> List[ChatTurn]:
+    if not episode_id:
+        return []
+    return [turn for turn in turns if turn.episode_id == episode_id]
 
 
 def _chunk_to_out(chunk: RetrievedChunk) -> RetrievedChunkOut:
@@ -287,25 +303,30 @@ def chat(req: ChatRequest) -> ChatResponse:
     history_context: Optional[str] = None
     history_turns_used = 0
     session_turns: List[ChatTurn] = []
+    long_term_turns: List[ChatTurn] = []
     effective_query = req.query
     preferred_language: Optional[str] = None
+    active_episode_id: Optional[str] = None
+    active_episode_slots: dict[str, str] = {}
+    force_no_clarify = False
+    active_episode = None
+    episode_transition_note: Optional[str] = None
+    last_assistant_answer: Optional[str] = None
 
     try:
         session_turns = memory_store.get_recent_session_turns(
             session_id=session_id,
             limit=max(1, int(os.getenv("CHAT_MEMORY_SESSION_LIMIT", "6"))),
         )
-        long_term_turns = memory_store.get_recent_user_turns(
-            user_id=user_id,
-            limit=max(1, int(os.getenv("CHAT_MEMORY_LONG_TERM_LIMIT", "4"))),
-            exclude_session_id=session_id,
-        )
-        history_turns_used = len(session_turns) + len(long_term_turns)
-        history_context = _build_history_context(
-            session_turns=session_turns,
-            user_turns=long_term_turns,
-            max_chars=max(500, int(os.getenv("CHAT_MEMORY_CONTEXT_MAX_CHARS", "1800"))),
-        )
+        if session_turns:
+            last_assistant_answer = session_turns[-1].answer
+        if os.getenv("CHAT_USE_LONG_TERM_CONTEXT", "0") == "1":
+            long_term_turns = memory_store.get_recent_user_turns(
+                user_id=user_id,
+                limit=max(1, int(os.getenv("CHAT_MEMORY_LONG_TERM_LIMIT", "4"))),
+                exclude_session_id=session_id,
+            )
+        active_episode = memory_store.get_active_episode(session_id=session_id)
     except Exception:
         policy_notes.append("memory_read_failed")
 
@@ -341,12 +362,14 @@ def chat(req: ChatRequest) -> ChatResponse:
                 return ChatResponse(
                     user_id=user_id,
                     session_id=session_id,
+                    episode_id=active_episode_id,
                     history_turns_used=history_turns_used,
                     effective_query=effective_query,
                     answer=answer,
                     language=language,
                     policy_notes=policy_notes,
                     references=[],
+                    episode_slots=active_episode_slots,
                     body_tags=sorted(body_tags),
                     intent_tags=sorted(intent_tags),
                     retrieved_chunks=[],
@@ -356,13 +379,74 @@ def chat(req: ChatRequest) -> ChatResponse:
     # Natural-chat fallback: when previous assistant asked a clarification question and
     # current user message is a short follow-up, merge recent user turns into one query
     # so retrieval and slot detection do not reset each turn.
-    if session_turns:
+    if session_turns and active_episode and not should_start_new_episode(req.query, active_episode):
         last_turn = session_turns[-1]
-        if _looks_like_clarification_answer(last_turn.answer, last_turn.policy_notes) and _looks_like_short_followup(req.query):
+        last_assistant_answer = last_turn.answer
+        if (
+            last_turn.episode_id == active_episode.episode_id
+            and _looks_like_clarification_answer(last_turn.answer, last_turn.policy_notes)
+            and _looks_like_short_followup(req.query)
+        ):
             merged_query = _merge_recent_user_queries(session_turns, req.query, max_queries=3)
             if merged_query and merged_query != req.query:
                 effective_query = merged_query
                 policy_notes.append("contextual_followup_merge")
+
+    try:
+        start_new_episode = should_start_new_episode(req.query, active_episode)
+        next_body_bucket = detect_body_bucket(req.query)
+        previous_body_bucket = str(active_episode.slots.get("body_bucket", "")).strip() if active_episode else ""
+        if start_new_episode and active_episode and previous_body_bucket and next_body_bucket and previous_body_bucket != next_body_bucket:
+            episode_transition_note = (
+                f"Topic shift detected: previous body={previous_body_bucket}, current body={next_body_bucket}. "
+                "Acknowledge the new problem focus. Ask once if the previous issue is already resolved; then continue with current issue only."
+            )
+
+        if start_new_episode:
+            if active_episode:
+                memory_store.close_active_episode(session_id=session_id)
+            active_episode = memory_store.start_episode(
+                user_id=user_id,
+                session_id=session_id,
+                summary=req.query[:120],
+            )
+            policy_notes.append("episode_started")
+
+        if active_episode:
+            active_episode_id = active_episode.episode_id
+            updates = extract_slot_updates(
+                effective_query,
+                previous_slots=active_episode.slots,
+            )
+            if updates:
+                active_episode = memory_store.update_episode_slots(
+                    episode_id=active_episode.episode_id,
+                    updates=updates,
+                    source_turn_id=None,
+                )
+                policy_notes.append("episode_slots_updated")
+
+            active_episode_slots = {k: str(v) for k, v in active_episode.slots.items()}
+            force_no_clarify = has_minimum_slots_for_plan(active_episode.slots)
+            if force_no_clarify:
+                policy_notes.append("slots_sufficient_for_plan")
+            slot_context = build_episode_context(active_episode)
+
+            episode_turns = _filter_turns_by_episode(session_turns, active_episode_id)
+            history_turns_used = len(episode_turns) + len(long_term_turns)
+            history_context = _build_history_context(
+                session_turns=episode_turns,
+                user_turns=long_term_turns,
+                max_chars=max(500, int(os.getenv("CHAT_MEMORY_CONTEXT_MAX_CHARS", "1800"))),
+            )
+            if slot_context:
+                history_context = f"{history_context}\n{slot_context}" if history_context else slot_context
+            if episode_transition_note:
+                history_context = (
+                    f"{history_context}\n{episode_transition_note}" if history_context else episode_transition_note
+                )
+    except Exception:
+        policy_notes.append("episode_memory_failed")
 
     try:
         result = rag.answer(
@@ -372,6 +456,9 @@ def chat(req: ChatRequest) -> ChatResponse:
             max_tokens=req.max_tokens,
             conversation_context=history_context,
             preferred_language=preferred_language,
+            force_no_clarify=force_no_clarify,
+            known_slots=active_episode_slots,
+            last_assistant_answer=last_assistant_answer,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RAG answer failed: {e}") from e
@@ -397,10 +484,12 @@ def chat(req: ChatRequest) -> ChatResponse:
         limit=req.video_limit,
     )
 
+    turn_id: Optional[int] = None
     try:
-        memory_store.add_turn(
+        turn_id = memory_store.add_turn(
             user_id=user_id,
             session_id=session_id,
+            episode_id=active_episode_id,
             query=req.query,
             answer=result.answer,
             policy_notes=policy_notes,
@@ -414,12 +503,14 @@ def chat(req: ChatRequest) -> ChatResponse:
     return ChatResponse(
         user_id=user_id,
         session_id=session_id,
+        episode_id=active_episode_id,
         history_turns_used=history_turns_used,
         effective_query=effective_query,
         answer=result.answer,
         language=language,
         policy_notes=policy_notes,
         references=references,
+        episode_slots=active_episode_slots,
         body_tags=sorted(body_tags),
         intent_tags=sorted(intent_tags),
         retrieved_chunks=[_chunk_to_out(c) for c in result.retrieved],
