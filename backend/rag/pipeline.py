@@ -507,7 +507,11 @@ class RehabRAG:
         slots = self._slots_with_known(self._extract_query_slots(query), known_slots)
         missing = self._missing_slots_for_prompt(slots)
         asked_recently = self._recently_asked_slots(conversation_context)
-        target = next((m for m in missing if m not in asked_recently), missing[0] if missing else "trigger_situation")
+        preferred_targets = [m for m in missing if m not in asked_recently]
+        if not preferred_targets:
+            preferred_targets = missing if missing else ["trigger_situation"]
+        # Template mode still keeps deterministic question order, but no hard cap.
+        selected_targets = preferred_targets
         body_bucket = self._body_bucket_hint(query, known_slots)
 
         if language == "zh":
@@ -534,9 +538,16 @@ class RehabRAG:
                 "severity": "目前疼痛大約幾分（0-10），以及會不會影響日常動作？",
                 "red_flag_check": "有沒有麻木無力、胸痛、發燒、暈眩或無法行走？",
             }
-            question = question_map.get(target, question_map["trigger_situation"])
+            questions = [question_map.get(target, question_map["trigger_situation"]) for target in selected_targets]
+            if len(questions) <= 1:
+                return (
+                    f"我先確認一件事：{questions[0]}\n"
+                    "若出現麻木無力、胸痛、暈眩、發燒或無法行走，請立即停止並就醫。"
+                )
+            head = f"我先確認 {len(questions)} 件事（補齊後我就直接給你方案）："
+            body = "\n".join([f"{idx}) {q}" for idx, q in enumerate(questions, start=1)])
             return (
-                f"我先確認一件事：{question}\n"
+                f"{head}\n{body}\n"
                 "若出現麻木無力、胸痛、暈眩、發燒或無法行走，請立即停止並就醫。"
             )
 
@@ -563,9 +574,16 @@ class RehabRAG:
             "severity": "What is the pain level now (0-10), and does it limit daily movement?",
             "red_flag_check": "Any numbness/weakness, chest pain, fever, dizziness, or inability to walk?",
         }
-        question = question_map_en.get(target, question_map_en["trigger_situation"])
+        questions = [question_map_en.get(target, question_map_en["trigger_situation"]) for target in selected_targets]
+        if len(questions) <= 1:
+            return (
+                f"One quick check before I give a precise plan: {questions[0]}\n"
+                "Please answer in one sentence (no A/B format needed).\n"
+                "If numbness/weakness, chest pain, dizziness, fever, or inability to walk appears, stop and seek urgent care."
+            )
+        body = "\n".join([f"{idx}) {q}" for idx, q in enumerate(questions, start=1)])
         return (
-            f"One quick check before I give a precise plan: {question}\n"
+            f"I need {len(questions)} quick checks before I give a precise plan:\n{body}\n"
             "Please answer in one sentence (no A/B format needed).\n"
                 "If numbness/weakness, chest pain, dizziness, fever, or inability to walk appears, stop and seek urgent care."
         )
@@ -632,10 +650,12 @@ class RehabRAG:
         slots = self._slots_with_known(slots, known_slots)
         missing = ", ".join(self._missing_slots_for_prompt(slots)) or "none"
         history = conversation_context if conversation_context else ("（無）" if language == "zh" else "(none)")
+        clarify_range_zh = "由你判斷需要幾題，原則是最少但足夠。"
+        clarify_range_en = "Decide how many questions are needed; keep it minimal but sufficient."
         if language == "zh":
             return (
                 "你現在在「釐清模式」，不要提供治療計畫。\n"
-                "任務：根據使用者原句與上下文，提出 1 題最關鍵追問，不要重問已知資訊。\n"
+                f"任務：根據使用者原句與上下文提出關鍵追問，不要重問已知資訊。{clarify_range_zh}\n"
                 "先檢查歷史上下文與 Known slots；已經提供過的欄位禁止再問。\n"
                 "如果看起來部位切換成新問題，先一句確認是否要切換主題，並詢問舊問題是否已緩解。\n"
                 "已知欄位（true 代表已提供）：\n"
@@ -653,7 +673,7 @@ class RehabRAG:
             )
         return (
             "You are in clarification-only mode. Do NOT provide a rehab plan yet.\n"
-            "Task: ask exactly one high-value follow-up question and do not re-ask known slots.\n"
+            f"Task: ask high-value follow-up questions and do not re-ask known slots. {clarify_range_en}\n"
             "First audit history context and Known slots. Do not ask already-provided fields.\n"
             "If the body area appears to have changed, briefly confirm topic switch and ask whether the previous issue has resolved.\n"
             "Known slots (true means provided):\n"
@@ -916,12 +936,13 @@ class RehabRAG:
                     "10) User asked for alternatives: provide at least 3 distinct options with when-to-use and stop conditions; avoid repeating the same advice.\n"
                 )
             if language == "zh":
+                clarify_rule_zh = "3) 若資訊不足，請自行判斷需要補問幾題（最少但足夠），且不得重問已提供資訊。\n"
                 return (
                     "你是安全優先的居家復健助理。請用自然對話語氣，不要僵硬模板。\n"
                     "規則：\n"
                     "1) 只使用檢索證據，不可捏造。\n"
                     "2) 先簡短回應使用者情境，再給可執行建議。\n"
-                    "3) 若資訊不足，最多補問 1 個最關鍵問題，不要一次連問多題。\n"
+                    f"{clarify_rule_zh}"
                     "3.1) 先讀取歷史上下文與 Known slots，禁止重問已提供資訊。\n"
                     "3.2) 若看起來換成新部位，先一句確認是否切換主問題，並問先前問題是否已緩解。\n"
                     "4) 有紅旗症狀時才明確就醫，不要每次都貼同一段固定警語。\n"
@@ -938,12 +959,13 @@ class RehabRAG:
                     f"使用者問題：\n{query}\n\n"
                     f"檢索內容：\n{context_text if context_text else '（無檢索結果）'}"
                 )
+            clarify_rule_en = "3) If information is missing, decide how many follow-up questions are needed (minimal but sufficient).\n"
             return (
                 "You are a safety-first home rehab assistant. Use a natural conversational style.\n"
                 "Rules:\n"
                 "1) Use retrieved evidence only; do not invent details.\n"
                 "2) Briefly reflect the user's situation, then give actionable advice.\n"
-                "3) If information is missing, ask at most one key follow-up question.\n"
+                f"{clarify_rule_en}"
                 "3.1) Read history context and Known slots first; never re-ask already provided details.\n"
                 "3.2) If body area appears switched, briefly confirm topic switch and ask whether previous issue has resolved.\n"
                 "4) Advise urgent care only when red flags are present; avoid repeating a fixed warning block every turn.\n"
