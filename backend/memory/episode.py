@@ -7,12 +7,20 @@ from .store import EpisodeState
 
 
 EXPLICIT_NEW_EPISODE_PATTERN = re.compile(
-    r"(另外一個問題|換個問題|不是這個|不是剛剛那個|現在變成|改成|new problem|another issue|different problem|now it is)",
+    r"(另外一個問題|換個問題|不是這個|不是剛剛那個|現在變成|改成|我現在|目前是|new problem|another issue|different problem|now it is)",
     re.IGNORECASE,
 )
-PAIN_SIGNAL_PATTERN = re.compile(r"(痛|痠|酸|刺痛|麻|不舒服|pain|sore|stiff|numb)", re.IGNORECASE)
+RESOLUTION_PATTERN = re.compile(
+    r"(好了|改善|緩解|不痛了|已經好|解決了|恢復了|resolved|better now|improved|no longer hurts)",
+    re.IGNORECASE,
+)
+MULTI_ISSUE_PATTERN = re.compile(
+    r"(兩個都|同時|一起|都會|both|at the same time|simultaneously)",
+    re.IGNORECASE,
+)
+PAIN_SIGNAL_PATTERN = re.compile(r"(痛|痠|酸|刺痛|麻|不舒服|落枕|pain|sore|stiff|numb|wry neck)", re.IGNORECASE)
 BODY_BUCKET_PATTERNS = {
-    "neck_shoulder": re.compile(r"(頸|肩|斜方|neck|shoulder|trapezi)", re.IGNORECASE),
+    "neck_shoulder": re.compile(r"(頸|脖|肩|斜方|落枕|neck|shoulder|trapezi|wry neck|stiff neck)", re.IGNORECASE),
     "back": re.compile(r"(背|腰|脊椎|下背|back|lumbar|spine)", re.IGNORECASE),
     "arm_hand": re.compile(r"(手腕|前臂|手肘|手|wrist|forearm|elbow|hand)", re.IGNORECASE),
     "leg_foot": re.compile(r"(膝|踝|腳|足|腿|knee|ankle|foot|leg|heel|achilles)", re.IGNORECASE),
@@ -68,6 +76,14 @@ def _detect_body_bucket(text: str) -> Optional[str]:
 
 def detect_body_bucket(text: str) -> Optional[str]:
     return _detect_body_bucket(text)
+
+
+def is_resolution_update(query: str) -> bool:
+    return bool(RESOLUTION_PATTERN.search(query))
+
+
+def is_multi_issue_query(query: str) -> bool:
+    return bool(MULTI_ISSUE_PATTERN.search(query))
 
 
 def _extract_slots(text: str) -> dict[str, Any]:

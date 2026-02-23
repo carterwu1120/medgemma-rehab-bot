@@ -69,6 +69,12 @@ class ChatMemoryStore(Protocol):
     def close_active_episode(self, *, session_id: str) -> None:
         ...
 
+    def set_episode_status(self, *, episode_id: str, status: str) -> None:
+        ...
+
+    def list_open_episodes(self, *, session_id: str, limit: int = 6) -> list[EpisodeState]:
+        ...
+
     def update_episode_slots(
         self,
         *,
@@ -125,6 +131,12 @@ class NullMemoryStore:
 
     def close_active_episode(self, *, session_id: str) -> None:
         return
+
+    def set_episode_status(self, *, episode_id: str, status: str) -> None:
+        return
+
+    def list_open_episodes(self, *, session_id: str, limit: int = 6) -> list[EpisodeState]:
+        return []
 
     def update_episode_slots(
         self,

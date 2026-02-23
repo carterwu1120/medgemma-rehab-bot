@@ -289,6 +289,49 @@ class SQLiteChatMemoryStore:
                 (session_id,),
             )
 
+    def set_episode_status(self, *, episode_id: str, status: str) -> None:
+        allowed = {"active", "paused", "resolved", "closed"}
+        next_status = status.strip().lower()
+        if next_status not in allowed:
+            raise ValueError(f"invalid episode status: {status}")
+        with self._connect() as conn:
+            if next_status in {"resolved", "closed"}:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET status = ?,
+                        closed_at = COALESCE(closed_at, datetime('now')),
+                        updated_at = datetime('now')
+                    WHERE episode_id = ?
+                    """,
+                    (next_status, episode_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET status = ?,
+                        updated_at = datetime('now')
+                    WHERE episode_id = ?
+                    """,
+                    (next_status, episode_id),
+                )
+
+    def list_open_episodes(self, *, session_id: str, limit: int = 6) -> list[EpisodeState]:
+        capped_limit = max(1, min(limit, 20))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT episode_id, user_id, session_id, status, summary, slots_json, created_at, updated_at, closed_at
+                FROM episodes
+                WHERE session_id = ? AND status IN ('active', 'paused')
+                ORDER BY updated_at DESC, id DESC
+                LIMIT ?
+                """,
+                (session_id, capped_limit),
+            ).fetchall()
+        return [self._row_to_episode(row) for row in rows]
+
     def update_episode_slots(
         self,
         *,

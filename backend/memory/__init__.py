@@ -3,6 +3,8 @@ from .episode import (
     detect_body_bucket,
     extract_slot_updates,
     has_minimum_slots_for_plan,
+    is_multi_issue_query,
+    is_resolution_update,
     should_start_new_episode,
 )
 from .follow_up import FollowUpResolution, resolve_follow_up_query
@@ -18,6 +20,8 @@ __all__ = [
     "extract_slot_updates",
     "FollowUpResolution",
     "has_minimum_slots_for_plan",
+    "is_multi_issue_query",
+    "is_resolution_update",
     "NullMemoryStore",
     "SQLiteChatMemoryStore",
     "resolve_follow_up_query",

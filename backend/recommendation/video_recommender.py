@@ -12,6 +12,15 @@ from backend.rag.pipeline import BODY_HINT_PATTERNS, SAFETY_QUERY_PATTERNS
 
 CJK_PATTERN = re.compile(r"[\u4e00-\u9fff]")
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+")
+BODY_TAG_PRIORITY = [
+    "body_neck_trap",
+    "body_shoulder",
+    "body_back_spine",
+    "body_elbow_wrist_hand",
+    "body_knee",
+    "body_ankle_foot",
+    "body_hip_glute",
+]
 
 
 def detect_query_language(query: str) -> str:
@@ -230,10 +239,16 @@ class YouTubeSearchProvider:
     def _build_queries(self, query: str, body_tags: Set[str], language: str) -> List[str]:
         templates = self.zh_templates if language == "zh" else self.en_templates
         results: List[str] = []
-        for tag in body_tags:
+        for tag in BODY_TAG_PRIORITY:
+            if tag not in body_tags:
+                continue
             q = templates.get(tag)
             if q:
-                results.append(q)
+                # Keep user's symptom words in query to reduce generic off-topic results.
+                if language == "zh":
+                    results.append(f"{q} {query}")
+                else:
+                    results.append(f"{q} {query}")
         if not results:
             if language == "zh":
                 results.append(f"{query} 居家復健 教學")
@@ -331,9 +346,11 @@ class YouTubeDataApiProvider:
                 "body_ankle_foot": "腳踝 扭傷 居家復健",
                 "body_hip_glute": "髖 臀肌 居家復健",
             }
-            for tag in body_tags:
+            for tag in BODY_TAG_PRIORITY:
+                if tag not in body_tags:
+                    continue
                 if tag in mapping:
-                    return mapping[tag]
+                    return f"{mapping[tag]} {query}"
             return f"{query} 居家復健 物理治療"
 
         mapping = {
@@ -345,9 +362,11 @@ class YouTubeDataApiProvider:
             "body_ankle_foot": "ankle sprain home rehab exercises",
             "body_hip_glute": "hip glute home rehabilitation exercises",
         }
-        for tag in body_tags:
+        for tag in BODY_TAG_PRIORITY:
+            if tag not in body_tags:
+                continue
             if tag in mapping:
-                return mapping[tag]
+                return f"{mapping[tag]} {query}"
         return f"{query} home rehabilitation exercises"
 
     def _fetch_video_meta(self, video_ids: List[str]) -> Dict[str, Dict[str, object]]:

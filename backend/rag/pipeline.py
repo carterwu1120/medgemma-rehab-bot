@@ -27,7 +27,7 @@ SAFETY_QUERY_PATTERNS = [
 ]
 BODY_HINT_PATTERNS: Dict[str, re.Pattern[str]] = {
     "body_shoulder": re.compile(r"\b(shoulder|rotator cuff|scapula)\b|肩|肩膀|旋轉肌袖", re.IGNORECASE),
-    "body_neck_trap": re.compile(r"\b(neck|cervical|trapezius)\b|頸|肩頸|斜方肌", re.IGNORECASE),
+    "body_neck_trap": re.compile(r"\b(neck|cervical|trapezius|wry neck|stiff neck)\b|頸|脖|肩頸|斜方肌|落枕", re.IGNORECASE),
     "body_back_spine": re.compile(r"\b(back|lumbar|thoracic|spine|low back)\b|背|腰|脊椎|下背", re.IGNORECASE),
     "body_knee": re.compile(r"\b(knee|patella|meniscus)\b|膝|膝蓋|半月板", re.IGNORECASE),
     "body_ankle_foot": re.compile(

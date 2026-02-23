@@ -18,9 +18,12 @@ from backend.memory import (
     detect_body_bucket,
     extract_slot_updates,
     has_minimum_slots_for_plan,
+    is_multi_issue_query,
+    is_resolution_update,
     resolve_follow_up_query,
     should_start_new_episode,
 )
+from backend.memory.store import EpisodeState
 from backend.rag import BM25Retriever, RehabRAG, RetrievedChunk
 from backend.recommendation import (
     CatalogVideoProvider,
@@ -40,6 +43,12 @@ REQUEST_LIKE_PATTERN = re.compile(
     r"(請|可以|怎麼|如何|給我|建議|計畫|方案|should|what|how|can you|advice|plan|\?)",
     re.IGNORECASE,
 )
+EPISODE_BUCKET_TO_BODY_TAG = {
+    "neck_shoulder": "body_neck_trap",
+    "back": "body_back_spine",
+    "arm_hand": "body_elbow_wrist_hand",
+    "leg_foot": "body_ankle_foot",
+}
 
 
 class ChatRequest(BaseModel):
@@ -191,6 +200,42 @@ def _chunk_to_out(chunk: RetrievedChunk) -> RetrievedChunkOut:
     )
 
 
+def _build_open_episodes_context(
+    *,
+    episodes: List[EpisodeState],
+    active_episode_id: Optional[str],
+) -> Optional[str]:
+    paused = [ep for ep in episodes if ep.episode_id != active_episode_id and ep.status in {"paused", "active"}]
+    if not paused:
+        return None
+    lines = ["Other unresolved problems in this session (paused):"]
+    for idx, ep in enumerate(paused[:4], start=1):
+        body = str(ep.slots.get("body_bucket", "unknown")).strip() or "unknown"
+        trigger = str(ep.slots.get("trigger", "")).strip()
+        suffix = f", trigger={trigger}" if trigger else ""
+        lines.append(f"- P{idx}: body={body}{suffix}, summary={_clip(ep.summary or '(none)', 100)}")
+    return "\n".join(lines)
+
+
+def _resolve_video_body_tags(
+    *,
+    query_body_tags: Set[str],
+    rag_body_tags: Set[str],
+    episode_slots: dict[str, str],
+) -> Set[str]:
+    # 1) Episode slot is the strongest signal for current conversation topic.
+    body_bucket = (episode_slots.get("body_bucket") or "").strip()
+    if body_bucket in EPISODE_BUCKET_TO_BODY_TAG:
+        return {EPISODE_BUCKET_TO_BODY_TAG[body_bucket]}
+
+    # 2) If user query has explicit body mention, trust it and avoid drift from retrieval noise.
+    if query_body_tags:
+        return set(query_body_tags)
+
+    # 3) Otherwise fallback to retrieval-derived body hints.
+    return set(rag_body_tags)
+
+
 def _video_to_out(video: VideoCandidate, language: str) -> VideoOut:
     return VideoOut(
         video_id=video.video_id,
@@ -312,6 +357,8 @@ def chat(req: ChatRequest) -> ChatResponse:
     active_episode = None
     episode_transition_note: Optional[str] = None
     last_assistant_answer: Optional[str] = None
+    open_episodes: List[EpisodeState] = []
+    multi_issue_note: Optional[str] = None
 
     try:
         session_turns = memory_store.get_recent_session_turns(
@@ -327,6 +374,10 @@ def chat(req: ChatRequest) -> ChatResponse:
                 exclude_session_id=session_id,
             )
         active_episode = memory_store.get_active_episode(session_id=session_id)
+        open_episodes = memory_store.list_open_episodes(
+            session_id=session_id,
+            limit=max(2, int(os.getenv("CHAT_MEMORY_OPEN_EPISODE_LIMIT", "6"))),
+        )
     except Exception:
         policy_notes.append("memory_read_failed")
 
@@ -393,6 +444,11 @@ def chat(req: ChatRequest) -> ChatResponse:
                 policy_notes.append("contextual_followup_merge")
 
     try:
+        if active_episode and is_resolution_update(req.query):
+            memory_store.set_episode_status(episode_id=active_episode.episode_id, status="resolved")
+            policy_notes.append("episode_marked_resolved")
+            active_episode = memory_store.get_active_episode(session_id=session_id)
+
         start_new_episode = should_start_new_episode(req.query, active_episode)
         next_body_bucket = detect_body_bucket(req.query)
         previous_body_bucket = str(active_episode.slots.get("body_bucket", "")).strip() if active_episode else ""
@@ -404,7 +460,8 @@ def chat(req: ChatRequest) -> ChatResponse:
 
         if start_new_episode:
             if active_episode:
-                memory_store.close_active_episode(session_id=session_id)
+                memory_store.set_episode_status(episode_id=active_episode.episode_id, status="paused")
+                policy_notes.append("episode_paused")
             active_episode = memory_store.start_episode(
                 user_id=user_id,
                 session_id=session_id,
@@ -445,6 +502,28 @@ def chat(req: ChatRequest) -> ChatResponse:
                 history_context = (
                     f"{history_context}\n{episode_transition_note}" if history_context else episode_transition_note
                 )
+
+            open_episodes = memory_store.list_open_episodes(
+                session_id=session_id,
+                limit=max(2, int(os.getenv("CHAT_MEMORY_OPEN_EPISODE_LIMIT", "6"))),
+            )
+            open_episodes_context = _build_open_episodes_context(
+                episodes=open_episodes,
+                active_episode_id=active_episode_id,
+            )
+            if open_episodes_context:
+                history_context = (
+                    f"{history_context}\n{open_episodes_context}" if history_context else open_episodes_context
+                )
+                policy_notes.append("open_episodes_context")
+
+            if is_multi_issue_query(req.query) and open_episodes_context:
+                multi_issue_note = (
+                    "User indicates multiple simultaneous problems. "
+                    "Provide separate concise guidance per problem and ask which one to prioritize first."
+                )
+                history_context = f"{history_context}\n{multi_issue_note}" if history_context else multi_issue_note
+                policy_notes.append("multi_issue_mode")
     except Exception:
         policy_notes.append("episode_memory_failed")
 
@@ -472,7 +551,12 @@ def chat(req: ChatRequest) -> ChatResponse:
             if tag.startswith("body_"):
                 rag_body_tags.add(tag)
 
-    body_tags = infer_body_tags(effective_query) | rag_body_tags
+    query_body_tags = infer_body_tags(effective_query)
+    body_tags = _resolve_video_body_tags(
+        query_body_tags=query_body_tags,
+        rag_body_tags=rag_body_tags,
+        episode_slots=active_episode_slots,
+    )
     intent_tags = infer_intent_tags(effective_query)
     references = _extract_chunk_refs(result.answer)
 
